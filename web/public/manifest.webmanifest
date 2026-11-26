@@ -1,0 +1,19 @@
+{
+  "name": "轻问练 · AI 陪练",
+  "short_name": "轻问练",
+  "description": "说想学什么，它拆出知识清单，逐题现写现练，答完即讲",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

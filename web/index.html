@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=5.0" />
+  <meta name="theme-color" content="#0f172a" />
+  <meta name="description" content="轻问练 · 说想学什么，它拆出知识清单，逐题现写现练" />
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="icon" href="./icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="./icon.svg" />
+  <title>轻问练 · AI 陪练</title>
+  <script>
+    // 首帧防闪烁：偏好在首次绘制前写入 CSS 变量（方案 1.4 要点）
+    (function () {
+      try {
+        var scale = localStorage.getItem('qw_font_scale') || '3';
+        var motion = localStorage.getItem('qw_motion') || '2';
+        var root = document.documentElement;
+        root.style.setProperty('--font-scale', scale);
+        root.setAttribute('data-motion', motion === '1' ? 'full' : 'lite');
+      } catch (e) {}
+    })();
+  </script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module" src="./src/main.jsx"></script>
+</body>
+</html>

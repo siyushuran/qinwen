@@ -1,0 +1,20 @@
+# 轻问练 · AI 陪练 —— fnOS 飞牛 NAS 部署
+# 单容器部署：Node 24 运行零依赖后端（内置 node:sqlite），同进程托管前端 SPA
+# 数据持久化：SQLite 单文件落在 ./data/，备份即拷贝该目录
+
+services:
+  qingwen:
+    image: node:24-alpine
+    container_name: qingwen-practice
+    restart: unless-stopped
+    ports:
+      - "18321:3000"          # 宿主端口:容器端口，可按需修改左侧
+    environment:
+      - PORT=3000
+      - DATA_DIR=/app/server/data
+      - WEB_DIR=/app/web/dist
+    volumes:
+      - ./server:/app/server            # 后端代码 + SQLite 数据（持久化）
+      - ./web/dist:/app/web/dist:ro    # 前端构建产物（只读）
+    working_dir: /app
+    command: ["node", "/app/server/server.mjs"]
