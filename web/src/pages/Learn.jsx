@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useMemo } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState, useMemo } from 'react';
 import { api, streamChat, toast } from '../api.js';
 import { navigate } from '../App.jsx';
 import Highlightable from '../components/Highlightable.jsx';
@@ -21,6 +21,8 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
   const [streaming, setStreaming] = useState(false);
   const [difficulty, setDifficulty] = useState(1);
   const chatEndRef = useRef(null);
+  const questionCardRef = useRef(null);
+  const cardHeightRef = useRef(0); // 切题前卡片高度，出题动画期间占位，避免页面骤缩把滚动位置弹回顶部
   const askStartRef = useRef(0);
   const seenIdsRef = useRef([]); // 本轮已见过的题目，「出下一题」用它避免重复
   const [highlights, setHighlights] = useState([]); // 当前题目的划线
@@ -79,6 +81,15 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }, [chat]);
 
+  // 新题就绪后定位到题干：切题时结果/追问面板卸载会让页面变短，浏览器会把视口弹到顶部
+  useLayoutEffect(() => {
+    if (phase !== 'ready' || !question || !questionCardRef.current) return;
+    const top = questionCardRef.current.getBoundingClientRect().top;
+    if (top < 0 || top > window.innerHeight * 0.6) {
+      questionCardRef.current.scrollIntoView({ block: 'start', behavior: 'auto' });
+    }
+  }, [phase, question?.id]);
+
   // 按来源类型/文本筛选当前题的划线，供题干/讲解/追问各自高亮
   const hlFor = (source, text) => hlRef.current.filter(h =>
     h.question_id === question?.id && h.source === source && text && h.text && text.includes(h.text)
@@ -92,6 +103,7 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
   const onHlAdded = (item) => { hlRef.current = [item, ...hlRef.current]; setHighlights(hlRef.current); };
 
   const ask = async (nodeId, diff = null, opts = {}) => {
+    cardHeightRef.current = questionCardRef.current?.offsetHeight || 0;
     setPhase('asking');
     setSelected(null); setOrderDraft([]); setResult(null); setErrorTags([]); setFollowups([]); setChat([]); setTagsSaved(false);
     if (diff) setDifficulty(diff);
@@ -205,9 +217,9 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
       </div>
 
       {/* 题目卡 */}
-      <div className="card enter-d1">
+      <div ref={questionCardRef} className="card enter-d1" style={{ scrollMarginTop: 12 }}>
         {phase === 'asking' && (
-          <div className="center" style={{ padding: '36px 10px' }}>
+          <div className="center" style={{ padding: '36px 10px', minHeight: Math.max(0, cardHeightRef.current - 36) || undefined }}>
             <div className="pulse-ring" style={{ width: 56, height: 56, borderRadius: '50%', margin: '0 auto 14px', background: 'var(--grad-soft)', display: 'grid', placeItems: 'center', fontSize: '1.6em' }}>
               <span className="think-orb">🧠</span>
             </div>
