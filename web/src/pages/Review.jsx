@@ -32,7 +32,7 @@ export default function Review() {
           </div>
         ) : (
           <>
-            <p className="sub mb12">{due.length} 个知识点到期，练一轮就把它们巩固掉</p>
+            <p className="sub mb12">{due.length} 个知识点到期，已按薄弱度与逾期时间优先排序</p>
             <ul style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
               {due.map((n, i) => (
                 <li key={n.id} className="map-node wave-item" style={{ animationDelay: `${i * 0.06}s`, cursor: 'pointer' }}
@@ -40,8 +40,12 @@ export default function Review() {
                   <span style={{ width: 12, height: 12, borderRadius: '50%', background: 'var(--accent)', flexShrink: 0 }} />
                   <div className="grow">
                     <strong>{n.name}</strong>
-                    <div className="muted small">到期 · 当前掌握 {Math.round(n.mastery * 100)}%</div>
+                    <div className="muted small">
+                      {n.recent_n > 0 ? `近 7 天 ${n.recent_n} 题 · 正确率 ${n.recent_rate}%` : '近 7 天无作答'}
+                      {' · 掌握 '}{Math.round(n.mastery * 100)}%
+                    </div>
                   </div>
+                  {n.recent_n > 0 && n.weakness >= 0.5 && <span className="chip" style={{ background: 'var(--surface-2)' }}>薄弱</span>}
                   <span className="btn sm primary">去练习</span>
                 </li>
               ))}
@@ -54,7 +58,7 @@ export default function Review() {
         <div className="row between">
           <div>
             <strong>💡 复习是怎么安排的</strong>
-            <p className="muted small mt8">答对 → 间隔自动拉长（明天→数天后）；答错 → 明天重新练。掌握度按认知点单独记录，随时进出。</p>
+            <p className="muted small mt8">答对 → 间隔自动拉长（明天→数天后）；答错 → 明天重新练。同时到期的知识点里，近 7 天正确率低、答错多、逾期久的排前面。</p>
           </div>
         </div>
       </div>

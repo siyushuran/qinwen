@@ -28,6 +28,10 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
   const [chatInput, setChatInput] = useState('');
   const [streaming, setStreaming] = useState(false);
   const [difficulty, setDifficulty] = useState(1);
+  const [autoDifficulty, setAutoDifficulty] = useState(() => localStorage.getItem('qw_auto_difficulty') !== '0');
+  const autoRef = useRef(autoDifficulty);
+  autoRef.current = autoDifficulty;
+  const [advice, setAdvice] = useState(null); // 该知识点的自适应难度建议
   const chatEndRef = useRef(null);
   const questionCardRef = useRef(null);
   const cardHeightRef = useRef(0); // 切题前卡片高度，出题动画期间占位，避免页面骤缩把滚动位置弹回顶部
@@ -73,7 +77,7 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
       const focused = active.find(n => n.id === Number(focusNode));
       if (focused) {
         const p = data.progress;
-        ask(focused.id, p?.node_id === focused.id && p.difficulty ? p.difficulty : difficulty);
+        ask(focused.id, autoRef.current ? null : (p?.node_id === focused.id && p.difficulty ? p.difficulty : difficulty));
         return;
       }
       // 接着上次的进度练：优先回到上次知识点；上次那题已作答则跳过，避免又从第一题/旧题开始
@@ -81,11 +85,20 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
       const target = active.find(n => n.id === p?.node_id) || active[0];
       if (target) {
         const excludeIds = p?.question_id && p.node_id === target.id && p.answered ? [p.question_id] : [];
-        ask(target.id, p?.difficulty || difficulty, { fresh: excludeIds.length > 0, excludeIds });
+        ask(target.id, autoRef.current ? null : (p?.difficulty || difficulty), { fresh: excludeIds.length > 0, excludeIds });
       }
     } catch (e) { toast(e.message, 'err'); }
   };
   useEffect(() => { loadDomain(); loadHighlights(); }, [domainId, focusNode, focusQuestion]);
+
+  const loadAdvice = async (nodeId) => {
+    if (!nodeId) return null;
+    try {
+      const r = await api(`/api/difficulty/advice?node_id=${nodeId}`);
+      setAdvice(r);
+      return r;
+    } catch { return null; }
+  };
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }, [chat]);
 
@@ -114,15 +127,24 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
     cardHeightRef.current = questionCardRef.current?.offsetHeight || 0;
     setPhase('asking');
     setSelected(null); setOrderDraft([]); setResult(null); setErrorTags([]); setFollowups([]); setChat([]); setTagsSaved(false);
-    if (diff) setDifficulty(diff);
     askStartRef.current = Date.now();
+    // 没显式指定难度且开了自动调档时，先按该知识点的真实作答记录定档
+    let useDiff = diff;
+    if (useDiff == null) {
+      if (autoRef.current) {
+        const a = await loadAdvice(nodeId);
+        if (a?.recommended) useDiff = a.recommended;
+      }
+      if (useDiff == null) useDiff = difficulty;
+    }
+    setDifficulty(useDiff);
     const excludeIds = [...new Set([...(opts.excludeIds || []), ...seenIdsRef.current])];
     try {
       const data = await api('/api/questions', {
         method: 'POST',
         body: JSON.stringify({
           node_id: Number(nodeId),
-          difficulty: diff ?? difficulty,
+          difficulty: useDiff,
           ...(opts.type ? { type: opts.type } : {}),
           ...(opts.regenerate ? { regenerate: true } : {}),
           ...(opts.fresh || excludeIds.length ? { force_new: true, exclude_ids: excludeIds } : {}),
@@ -152,6 +174,7 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
       });
       setResult(data);
       setPhase('done');
+      if (autoRef.current) loadAdvice(question.node_id); // 刚答完就更新下一题的建议档位
     } catch (e) {
       toast(e.message, 'err');
       setPhase('ready');
@@ -187,22 +210,35 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
     );
   };
 
-  const chooseDifficulty = (d) => {
+  const chooseDifficulty = (d, keepAuto = false) => {
     if (d === difficulty) return;
+    // 手动点档位即退出自动调档，避免下一次出题又跳回建议档；采纳系统建议时保持自动
+    if (autoRef.current && !keepAuto) {
+      setAutoDifficulty(false);
+      localStorage.setItem('qw_auto_difficulty', '0');
+      toast('已切到手动调档，点「自动」可恢复', '');
+    }
     setDifficulty(d);
     // 正在做题时立即按新难度重新生成，跳过旧难度缓存；idle 状态只记下选择
     if (question && phase !== 'asking') ask(question.node_id, d, { fresh: true, regenerate: true });
+  };
+  const toggleAuto = () => {
+    const next = !autoDifficulty;
+    setAutoDifficulty(next);
+    localStorage.setItem('qw_auto_difficulty', next ? '1' : '0');
+    if (next && question) loadAdvice(question.node_id);
+    toast(next ? '已开启自动调档' : '已关闭自动调档', 'ok');
   };
   const nextQuestion = () => {
     if (!question || nodes.length === 0) return;
     const idx = nodes.findIndex(n => n.id === question.node_id);
     // 按知识点顺序推进、到末尾回到开头；只有一个知识点时就在原知识点出新题
     const target = idx >= 0 && nodes.length > 1 ? nodes[(idx + 1) % nodes.length] : nodes[0];
-    ask(target.id, difficulty, { fresh: true });
+    ask(target.id, autoRef.current ? null : difficulty, { fresh: true });
   };
   const nextSimilar = () => {
     const node = nodes.find(n => n.id === question.node_id);
-    ask(node.id, Math.min(5, difficulty + 1));
+    ask(node.id, autoRef.current ? null : Math.min(5, difficulty + 1));
   };
   const nextNew = () => {
     const others = nodes.filter(n => n.id !== question.node_id);
@@ -237,7 +273,20 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
               onClick={() => chooseDifficulty(d)}>{d}</button>
           ))}
           <span className="muted small">{DIFF_LABEL[difficulty]} · {DIFF_DESC[difficulty]}</span>
+          <button className={`chip ${autoDifficulty ? 'on' : ''}`} style={{ padding: '4px 10px', fontSize: '.8em' }}
+            title="根据最近作答自动调整难度：连对升档、连错降档" onClick={toggleAuto}>🤖 自动</button>
         </div>
+        {advice && (
+          <div className="row mt8" style={{ gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            <span className="chip" style={{ background: 'var(--grad-soft)' }}>
+              {advice.phase === 'calibrating' ? '定档中' : '自适应'} · {advice.samples} 题样本
+            </span>
+            <span className="muted small grow" style={{ minWidth: 120 }}>{advice.reason}</span>
+            <button className="btn sm" disabled={advice.recommended === difficulty}
+              title={advice.recommended === difficulty ? '当前已是建议档位' : '按建议档位重新出题'}
+              onClick={() => chooseDifficulty(advice.recommended, true)}>按建议 {advice.recommended} 档出题</button>
+          </div>
+        )}
       </div>
 
       {/* 题目卡 */}

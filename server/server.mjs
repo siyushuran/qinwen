@@ -1046,6 +1046,56 @@ routes['GET /api/questions/:id'] = (req, res, m) => {
 };
 
 // 出题（默认落库缓存复用；force_new 时跳过已见过的题，保证「下一题」是新题）
+// 自适应难度建议：只看这个知识点最近的真实作答，不引入新表。
+// 前 3 题用于定档；之后连对升档、连错降档，否则按近 10 题正确率微调。
+routes['GET /api/difficulty/advice'] = (req, res) => {
+  if (!authed(req)) return json(res, 401, { error: '未登录' });
+  const nodeId = intIn(new URL(req.url, 'http://localhost').searchParams.get('node_id'), 1, 2147483647, 0);
+  if (!nodeId) return json(res, 400, { error: '缺少 node_id' });
+  if (!db.prepare('SELECT 1 FROM node WHERE id = ?').get(nodeId)) return json(res, 404, { error: '知识点不存在' });
+  const rows = db.prepare(`
+    SELECT a.is_correct, a.created_at, q.difficulty
+    FROM attempt a JOIN question q ON q.id = a.question_id
+    WHERE a.node_id = ? ORDER BY a.created_at DESC, a.id DESC LIMIT 30`).all(nodeId);
+  const byDifficulty = {};
+  for (const r of rows) {
+    const d = intIn(r.difficulty, 1, 5, 1);
+    const s = byDifficulty[d] || (byDifficulty[d] = { n: 0, ok: 0 });
+    s.n++; s.ok += r.is_correct ? 1 : 0;
+  }
+  let recommended = 2, reason = '', phase = 'calibrating';
+  if (rows.length === 0) {
+    reason = '还没有作答记录，先用基础档试水';
+  } else if (rows.length < 3) {
+    reason = `已答 ${rows.length} 题，答满 3 题后开始自动定档`;
+  } else {
+    phase = 'adaptive';
+    const lastDiff = intIn(rows[0].difficulty, 1, 5, 2);
+    const lastCorrect = rows[0].is_correct === 1;
+    let streak = 0;
+    // 连对/连错必须在同一难度档内累计，跨档不接续
+    for (const r of rows) {
+      if (intIn(r.difficulty, 1, 5, 0) === lastDiff && (r.is_correct === 1) === lastCorrect) streak++;
+      else break;
+    }
+    if (streak >= 2) {
+      recommended = Math.max(1, Math.min(5, lastDiff + (lastCorrect ? 1 : -1)));
+      reason = `同档连续 ${streak} 题${lastCorrect ? '答对' : '答错'}，${lastCorrect ? '升' : '降'}到 ${recommended} 档`;
+    } else {
+      const recent = rows.slice(0, 10);
+      const rate = recent.filter(r => r.is_correct === 1).length / recent.length;
+      const pct = Math.round(rate * 100);
+      if (rate >= 0.85 && lastDiff < 5) { recommended = lastDiff + 1; reason = `近 ${recent.length} 题正确率 ${pct}%，升到 ${recommended} 档`; }
+      else if (rate <= 0.4 && lastDiff > 1) { recommended = lastDiff - 1; reason = `近 ${recent.length} 题正确率 ${pct}%，降到 ${recommended} 档巩固`; }
+      else { recommended = lastDiff; reason = `近 ${recent.length} 题正确率 ${pct}%，保持 ${recommended} 档`; }
+    }
+  }
+  json(res, 200, {
+    ok: true, node_id: nodeId, recommended, reason, phase, samples: rows.length,
+    by_difficulty: [1, 2, 3, 4, 5].map(d => ({ difficulty: d, ...(byDifficulty[d] || { n: 0, ok: 0 }) })),
+  });
+};
+
 routes['POST /api/questions'] = async (req, res) => {
   if (!authed(req)) return json(res, 401, { error: '未登录' });
   const b = await readBody(req);
@@ -1244,14 +1294,36 @@ routes['POST /api/attempts/:id/error-tags'] = async (req, res, m) => {
   json(res, 200, { ok: true, error_tags: tags });
 };
 
-// 复习队列（到期知识点）
+// 复习队列（到期知识点）：先按薄弱度与逾期天数排优先级，而不是只按到期时间。
+// 近 7 天正确率越低、答错越多、逾期越久越靠前；没有近期数据的节点按"未知"居中。
 routes['GET /api/review'] = (req, res) => {
   if (!authed(req)) return json(res, 401, { error: '未登录' });
+  const since = new Date(Date.now() - 7 * 86400000).toISOString();
   const rows = db.prepare(`
-    SELECT n.*, r.due_at, r.interval_days FROM review_slot r
-    JOIN node n ON n.id = r.node_id
-    WHERE r.due_at <= ? AND n.status = 'active' ORDER BY r.due_at LIMIT 50`).all(now());
-  json(res, 200, { due: rows });
+    WITH recent AS (
+      SELECT q.node_id AS node_id, COUNT(*) AS n, SUM(a.is_correct) AS ok,
+             SUM(CASE WHEN a.is_correct = 0 THEN 1 ELSE 0 END) AS wrong
+      FROM attempt a JOIN question q ON q.id = a.question_id
+      WHERE a.created_at >= ? GROUP BY q.node_id
+    )
+    SELECT nd.*, r.due_at, r.interval_days,
+           COALESCE(recent.n, 0) AS recent_n,
+           COALESCE(recent.ok, 0) AS recent_ok,
+           COALESCE(recent.wrong, 0) AS recent_wrong
+    FROM review_slot r
+    JOIN node nd ON nd.id = r.node_id
+    LEFT JOIN recent ON recent.node_id = nd.id
+    WHERE r.due_at <= ? AND nd.status = 'active'`).all(since, now());
+  const stamp = Date.now();
+  for (const r of rows) {
+    const acc = r.recent_n ? r.recent_ok / r.recent_n : null;
+    r.recent_rate = acc === null ? null : Math.round(acc * 100);
+    r.weakness = acc === null ? 0.5 : Math.round((1 - acc) * 100) / 100;
+    const overdue = Math.max(0, (stamp - new Date(r.due_at).getTime()) / 86400000);
+    r.priority = Math.round((overdue * 0.6 + r.weakness * 4 + Math.min(r.recent_wrong, 5) * 0.3) * 100) / 100;
+  }
+  rows.sort((a, b) => b.priority - a.priority || String(a.due_at).localeCompare(String(b.due_at)));
+  json(res, 200, { due: rows.slice(0, 50) });
 };
 
 // 错题本（按知识点/错因聚类展示，答稳自动移出）
@@ -1333,6 +1405,34 @@ routes['GET /api/stats'] = (req, res) => {
     prevKey = r.d;
   }
 
+  // 薄弱知识点排行：至少 2 次作答才入榜，正确率低的排前面；附带错因与近 7 天错题数
+  const weakRows = db.prepare(`
+    SELECT nd.id AS node_id, nd.name AS node_name, dm.id AS domain_id, dm.name AS domain_name,
+           COUNT(*) AS attempts, SUM(a.is_correct) AS correct
+    FROM attempt a
+    JOIN question q ON q.id = a.question_id
+    JOIN node nd ON nd.id = q.node_id
+    JOIN domain dm ON dm.id = nd.domain_id
+    GROUP BY nd.id
+    HAVING COUNT(*) >= 2
+    ORDER BY (1 - SUM(a.is_correct) * 1.0 / COUNT(*)) DESC, COUNT(*) DESC, nd.id
+    LIMIT 8`).all();
+  const since = new Date(Date.now() - 7 * 86400000).toISOString();
+  const weakNodes = weakRows.map(r => {
+    const tagRows = db.prepare(`SELECT a.error_tags FROM attempt a JOIN question q ON q.id = a.question_id
+      WHERE q.node_id = ? AND a.error_tags IS NOT NULL AND a.error_tags <> '' AND a.error_tags <> '[]'`).all(r.node_id);
+    const counts = {};
+    for (const t of tagRows) for (const tag of parseTags(t.error_tags)) counts[tag] = (counts[tag] || 0) + 1;
+    const recentWrong = db.prepare(`SELECT COUNT(*) AS n FROM attempt a JOIN question q ON q.id = a.question_id
+      WHERE q.node_id = ? AND a.is_correct = 0 AND a.created_at >= ?`).get(r.node_id, since).n;
+    return {
+      ...r,
+      rate: Math.round((r.correct / r.attempts) * 100),
+      recent_wrong: recentWrong,
+      top_tags: Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([tag, count]) => ({ tag, count })),
+    };
+  });
+
   json(res, 200, {
     ok: true, tz,
     total: total.n || 0,
@@ -1345,6 +1445,7 @@ routes['GET /api/stats'] = (req, res) => {
     by_day: byDay,
     by_month: byMonth,
     by_year: byYear,
+    weak_nodes: weakNodes,
   });
 };
 

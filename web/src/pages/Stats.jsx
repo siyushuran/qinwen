@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { api, toast } from '../api.js';
+import { navigate } from '../App.jsx';
 
 // 热力图分档：按当日题数映射 5 级色块（0 空档 + 4 级浓度，GitHub 贡献墙常用做法）
 const HEAT = [
@@ -154,6 +155,42 @@ export default function Stats() {
               </button>
             )}
           </>
+        )}
+      </div>
+
+      <div className="card enter-d2">
+        <h2>🎯 最该补的知识点</h2>
+        <p className="sub mb12">按累计正确率排序（至少 2 次作答），点条目直接去练</p>
+        {(data.weak_nodes || []).length === 0 ? (
+          <p className="muted">还没有足够数据，答满 2 题后开始生成</p>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {data.weak_nodes.map((w, i) => (
+              <div key={w.node_id} className="wave-item" role="button" tabIndex={0}
+                style={{
+                  animationDelay: `${i * 0.04}s`, cursor: 'pointer',
+                  padding: '10px 12px', borderRadius: 'var(--radius-sm)', background: 'var(--surface-2)',
+                }}
+                onClick={() => navigate(`/learn/${w.domain_id}?node=${w.node_id}`)}
+                onKeyDown={e => { if (e.key === 'Enter') navigate(`/learn/${w.domain_id}?node=${w.node_id}`); }}>
+                <div className="row between" style={{ gap: 8 }}>
+                  <div className="grow" style={{ minWidth: 0 }}>
+                    <strong>{w.node_name}</strong>
+                    <div className="muted small">{w.domain_name} · {w.attempts} 题 · 近 7 天错 {w.recent_wrong} 次</div>
+                  </div>
+                  <span className="small" style={{ color: w.rate >= 60 ? 'var(--ok)' : 'var(--err)', fontWeight: 700 }}>{w.rate}%</span>
+                </div>
+                <div style={{ height: 5, borderRadius: 999, background: 'var(--line)', marginTop: 6, overflow: 'hidden' }}>
+                  <div style={{ height: '100%', width: `${w.rate}%`, background: w.rate >= 60 ? 'var(--grad)' : 'var(--err)' }} />
+                </div>
+                {w.top_tags.length > 0 && (
+                  <div className="chips mt8">
+                    {w.top_tags.map(t => <span key={t.tag} className="chip">{t.tag} ×{t.count}</span>)}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
         )}
       </div>
 
