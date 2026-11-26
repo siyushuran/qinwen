@@ -12,7 +12,7 @@
                      └─ 同进程托管前端 SPA 静态文件
 ```
 
-## 已实现功能（对齐方案 M0–M3 核心）
+## 已实现功能（覆盖方案 M0–M4 的资料与学情核心；TTS/ASR 未做）
 
 - 单用户访问密码（scrypt 哈希存储，Bearer Token 鉴权）
 - 资料库（M4）：粘贴文章/Markdown → 按标题切块 → 生成摘要、按资料拆清单、接地问答、资料出题
@@ -37,12 +37,14 @@
 
 ```
 qingwen-practice/
-├── server/server.mjs        # 后端（零依赖，Node 24 内置 node:sqlite）
-├── web/                     # 前端源码（Vite + React）
-│   ├── src/                 # 页面与组件
-│   ├── public/              # manifest / icon
-│   └── dist/               # 构建产物（部署用）
-├── docker-compose.yml       # NAS 部署配置
+├── server/server.mjs           # 后端（零依赖，Node 24 内置 node:sqlite）
+├── server/*-test.mjs           # 端到端测试（临时库 + 模拟模型）
+├── server/seed-article.mjs     # 一次性资料导入脚本
+├── web/                        # 前端源码（Vite + React）
+│   ├── src/pages/              # 含 Materials.jsx / MaterialDetail.jsx
+│   ├── public/                 # manifest / icon
+│   └── dist/                   # 构建产物（部署用，随仓库提交）
+├── docker-compose.yml          # NAS 部署配置
 └── README.md
 ```
 
@@ -65,8 +67,11 @@ cd server && PORT=3000 node server.mjs
 cd web && npm install && npm run dev   # 开发
 cd web && npm run build                # 构建到 dist/
 
-# 端到端冒烟测试（模拟模型 + 真实后端，覆盖主要流程与关键边界）
-node server/smoke-test.mjs
+# 端到端测试（均为临时库 + 模拟模型，不影响线上数据）
+node server/smoke-test.mjs          # 主流程与关键边界
+node server/bank-import-test.mjs    # 题库导入幂等与出题
+node server/material-test.mjs       # 资料入库/摘要/清单/出题/问答/划线
+node server/highlight-test.mjs      # 划线增删改查/搜索/导出
 
 # 部署后静态资源/健康检查验证
 node verify.js <目标地址> <web/dist路径> <结果输出路径>
@@ -99,7 +104,7 @@ node verify.js <目标地址> <web/dist路径> <结果输出路径>
 - 模型地址：只允许公网 HTTPS；本地 Ollama 等回环 HTTP 例外；拒绝内网/链路本地/云元数据地址，禁止跟随跳转，避免 API Key 被带往任意地址。日志与错误响应不回显上游响应体。
 - 数据导出：使用 `VACUUM INTO` 生成一致性快照（WAL 下直接拷贝主库可能是空文件），删除令牌、密码哈希、模型密钥后再 `VACUUM` 重建页面，避免明文残留在空闲页；恢复后需重新设置密码与模型配置。
 - 写入可靠性：作答、出题、清单重建、删除均使用 SQLite 事务；同一知识点的出题串行化，避免并发产生重复题或丢失掌握度更新。
-- 限流：登录 8 次/10 分钟、初始化 5 次/10 分钟、出题 40 次/分钟（「出下一题」12 次/分钟）、作答 60 次/分钟、拆解 5 次/分钟、追问 20 次/分钟（最多 2 路并发）、导出 5 次/分钟；模型调用全局最多 2 并发，单知识点题目上限 200 道。
+- 限流：登录 8 次/10 分钟、初始化 5 次/10 分钟、出题 40 次/分钟（「出下一题」12 次/分钟）、作答 60 次/分钟、拆解 5 次/分钟、追问 20 次/分钟（最多 2 路并发）、导出 5 次/分钟；资料入库/摘要/出题各 10 次/分钟、资料问答 20 次/分钟；模型调用全局最多 2 并发，单知识点题目上限 200 道。
 
 ## 外部题库：芒格思维模型（munger-kb）
 
@@ -137,7 +142,7 @@ node bank-import-test.mjs
 
 ## 资料库（文章 / Markdown 接入）
 
-「资料」页可粘贴公众号文章正文或 Markdown。服务端按标题层级切块（单块约 1200 字），存 `material` / `material_chunk` 两张表；后续摘要、清单、出题、问答都带出处编号，争议内容默认按「文章称」口径处理（可在导入时选择）。
+「资料」页可粘贴公众号文章正文或 Markdown。服务端按标题层级切块（单块约 1200 字），存 `material` / `material_chunk` 两张表；后续摘要、清单、出题、问答都带出处编号。导入时 `claim_policy` 可选 `article_claim`（争议内容按「文章称」口径，默认且推荐）、`verified`、`mixed`。
 
 - 摘要：ASD-STE100 简化风格，输出一句话 + 要点 + 时间线，用快速模型生成并缓存。
 - 按资料拆清单：只依据资料正文生成「知识面 → 知识点」，可一键创建领域。
@@ -163,14 +168,16 @@ API（均需 Bearer Token）：
 一次性导入文章（需要网站登录 token）：
 
 ```bash
-QW_TOKEN='<网站token>' node server/seed-article.mjs https://qw.icge.top:1487 ../outputs/qinwen-article-learning-material.md
+QW_TOKEN='<网站token>' node server/seed-article.mjs https://qw.icge.top:1487 ../outputs/qinwen-article-learning-material.md [领域名]
 ```
+
+令牌也可从只读数据库副本读取，避免在命令行暴露：`QW_DB=/path/to/qingwen.db node server/seed-article.mjs ...`。`SEED_RESULT_FILE=<路径>` 可把非敏感导入结果写入文件供容器外验证，验证后必须删除。
 
 验证：`node server/material-test.mjs`（临时库 + 模拟模型，覆盖入库/摘要/清单/出题/问答/划线/通用导入）。
 
 ## 划线收藏
 
-在题目卡里选中**题干、作答后的讲解、AI 追问回复**中的任意文字，浮出的「✍️ 划线收藏」按钮会把原句存入划线本；已划线的句子在原处高亮显示。用于收集芒格模型里值得回看的句子。
+在题目卡里选中**题干、作答后的讲解、AI 追问回复**中的任意文字，浮出的「✍️ 划线收藏」按钮会把原句存入划线本；已划线的句子在原处高亮显示。用于收集题库或资料片段里值得回看的句子。
 
 - 入口：底部导航「划线」，或 `#/highlights`
 - 每条划线可加备注、按领域/关键词筛选、跳转到来源知识点或原始网页、删除
