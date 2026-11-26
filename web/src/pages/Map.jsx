@@ -49,7 +49,7 @@ export default function MapPage({ domainId }) {
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, paddingLeft: 20 }}>
                   {points.map(p => (
                     <button key={p.id} className="chip" style={{ borderColor: masteryColor(p.mastery) }}
-                      onClick={() => navigate(`/learn/${domainId}`)}>
+                      onClick={() => navigate(`/learn/${domainId}?node=${p.id}`)}>
                       {p.name} · {Math.round(p.mastery * 100)}%
                     </button>
                   ))}

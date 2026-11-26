@@ -4,6 +4,9 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import dns from 'node:dns/promises';
+import net from 'node:net';
+import { promisify } from 'node:util';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 
@@ -84,7 +87,45 @@ CREATE TABLE IF NOT EXISTS chat_turn (
   content TEXT,
   ts TEXT
 );
+-- 做题进度：按领域记住当前知识点/题目/难度，支持随时进出接着练
+CREATE TABLE IF NOT EXISTS progress (
+  domain_id INT PRIMARY KEY,
+  node_id INT NOT NULL,
+  question_id INT,
+  difficulty INT DEFAULT 1,
+  answered INT DEFAULT 0,
+  updated_at TEXT
+);
+-- 划线收藏：用户在题干/讲解/追问中划下的有价值句子，可追溯到来源题目
+CREATE TABLE IF NOT EXISTS highlight (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  text TEXT NOT NULL,
+  source TEXT DEFAULT 'explanation',
+  question_id INT,
+  node_id INT,
+  domain_id INT,
+  question_stem TEXT DEFAULT '',
+  source_url TEXT DEFAULT '',
+  note TEXT DEFAULT '',
+  created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_highlight_created ON highlight(created_at);
+CREATE INDEX IF NOT EXISTS idx_highlight_domain ON highlight(domain_id);
 `);
+
+// 旧库平滑升级：新增列不能影响已有数据
+function ensureColumn(table, column, ddl) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
+  if (!cols.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+}
+ensureColumn('domain', 'level', "TEXT DEFAULT '没学过'");
+ensureColumn('mistake', 'error_tags', "TEXT DEFAULT '[]'");
+// 外部题库（munger-kb）导入：source_key 用于幂等识别，source_url 保留来源可追溯
+ensureColumn('domain', 'source_key', "TEXT DEFAULT ''");
+ensureColumn('node', 'source_key', "TEXT DEFAULT ''");
+ensureColumn('question', 'source_key', "TEXT DEFAULT ''");
+ensureColumn('question', 'source_url', "TEXT DEFAULT ''");
+ensureColumn('question', 'source_type', "TEXT DEFAULT ''");
 
 // ---------- 偏好与配置 ----------
 function getSetting(key, fallback = null) {
@@ -123,9 +164,62 @@ function modelAvailable() {
   return Boolean(c.base_url && c.chat_model);
 }
 
+// ---------- 出站地址校验：防止 SSRF 与 API Key 外带 ----------
+function isLoopbackIp(ip) {
+  return ip === '::1' || /^127\./.test(ip) || ip === '0:0:0:0:0:0:0:1';
+}
+function isPrivateIp(ip) {
+  const v4 = ip.startsWith('::ffff:') ? ip.slice(7) : ip;
+  if (/^10\./.test(v4) || /^192\.168\./.test(v4) || /^172\.(1[6-9]|2\d|3[01])\./.test(v4)) return true;
+  if (/^169\.254\./.test(v4) || /^100\.(6[4-9]|[7-9]\d|1\d\d)\./.test(v4) || /^0\./.test(v4)) return true;
+  if (/^fe[89ab]/i.test(ip) || /^f[cd]/i.test(ip) || ip === '::') return true;
+  return false;
+}
+// 原则：密钥只发给可验证的公网 HTTPS 端点；本地 Ollama 等回环 HTTP 例外，禁止跳转到内网。
+async function checkBaseUrl(raw) {
+  if (!raw) return '';
+  if (typeof raw !== 'string' || raw.length > 300) fail(400, 'Base URL 不合法');
+  let u;
+  try { u = new URL(raw); } catch { fail(400, 'Base URL 不合法'); }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') fail(400, '仅支持 http/https 地址');
+  if (u.username || u.password || u.hash) fail(400, 'Base URL 不合法');
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  let addrs;
+  if (net.isIP(host)) addrs = [host];
+  else {
+    try { addrs = (await dns.lookup(host, { all: true })).map(x => x.address); }
+    catch { fail(400, 'Base URL 域名无法解析'); }
+    if (!addrs.length) fail(400, 'Base URL 域名无法解析');
+  }
+  for (const addr of addrs) {
+    const loop = isLoopbackIp(addr) || isLoopbackIp(addr.startsWith('::ffff:') ? addr.slice(7) : addr);
+    if (isPrivateIp(addr) && !loop) fail(400, '不允许指向内网或云元数据地址');
+    if (u.protocol === 'http:' && !loop) fail(400, '明文 HTTP 仅允许本机地址');
+  }
+  return u.toString().replace(/\/+$/, '');
+}
+// 历史脏配置在调用时再校验一次，错误文案保持通用
+async function assertModelEndpoint(raw) {
+  try { await checkBaseUrl(raw); } catch { throw new Error('模型地址不安全，请在设置页检查 Base URL'); }
+}
+
+// 模型并发闸门：避免高频调用打满上游和本机资源
+let modelActive = 0;
+const modelWaiters = [];
+async function withModelSlot(fn) {
+  while (modelActive >= 2) await new Promise(resolve => modelWaiters.push(resolve));
+  modelActive++;
+  try { return await fn(); } finally {
+    modelActive--;
+    const next = modelWaiters.shift();
+    if (next) next();
+  }
+}
+
 async function llmChat(messages, opts = {}) {
   const c = llmConfig();
   if (!modelAvailable()) throw new Error('模型未配置：请在设置页填写 Base URL、API Key 与模型名');
+  await assertModelEndpoint(c.base_url);
   const model = (opts.model === 'fast' && c.fast_model) ? c.fast_model : c.chat_model;
   const body = {
     model,
@@ -135,24 +229,24 @@ async function llmChat(messages, opts = {}) {
   };
   if (opts.json) body.response_format = { type: 'json_object' };
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 120000);
+  const timer = setTimeout(() => ctrl.abort(), opts.stream ? 60000 : 30000);
+  const signals = opts.signal ? [ctrl.signal, opts.signal] : [ctrl.signal];
+  const signal = AbortSignal.any ? AbortSignal.any(signals) : ctrl.signal;
   try {
-    const resp = await fetch(`${c.base_url}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${c.api_key}`,
-      },
-      body: JSON.stringify(body),
-      signal: ctrl.signal,
+    return await withModelSlot(async () => {
+      const resp = await fetch(`${c.base_url}/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${c.api_key}` },
+        body: JSON.stringify(body),
+        signal,
+        redirect: 'error',
+      });
+      // 上游响应体可能含密钥/内网信息，不回显给客户端
+      if (!resp.ok || !resp.body) throw new Error(`模型服务返回 ${resp.status}`);
+      if (opts.stream) return resp.body;
+      const data = await resp.json();
+      return data.choices?.[0]?.message?.content ?? '';
     });
-    if (!resp.ok || !resp.body) {
-      const text = await resp.text().catch(() => '');
-      throw new Error(`模型服务返回 ${resp.status}：${text.slice(0, 200)}`);
-    }
-    if (opts.stream) return resp.body; // ReadableStream，交给 SSE 转发
-    const data = await resp.json();
-    return data.choices?.[0]?.message?.content ?? '';
   } finally {
     clearTimeout(timer);
   }
@@ -168,9 +262,12 @@ function promptBuildList(domainName, levelDesc) {
 要求：3~5 个知识面，每个知识面 3~6 个知识点，知识点要具体、可出题、贴合兴趣学习场景。`;
 }
 
-function promptMakeQuestion(nodeName, level, difficulty, interests) {
+function promptMakeQuestion(nodeName, level, difficulty, interests, avoidStems = []) {
   const scene = interests ? `，尽量融入这些兴趣场景：${interests}` : '';
-  return `你是一位出题老师。请围绕知识点「${nodeName}」（认知层级 ${level}，难度档 ${difficulty}/5）出一道题${scene}。
+  const avoid = avoidStems.length
+    ? `\n避免与这些已出过的题目重复（换角度、换情境、换问法）：\n${avoidStems.map((s, i) => `${i + 1}. ${s}`).join('\n')}`
+    : '';
+  return `你是一位出题老师。请围绕知识点「${nodeName}」（认知层级 ${level}，难度档 ${difficulty}/5）出一道题${scene}。${avoid}
 输出严格 JSON（不要 markdown）：
 {"type":"single","stem":"题干","options":["选项A","选项B","选项C","选项D"],"answer":"A","explanation":"解析，简洁讲清为什么"}
 type 只在 "single"（单选）和 "judge"（判断）中选；judge 时 options 为 ["正确","错误"]，answer 为 "正确" 或 "错误"。题干自然、生活化、无应试感。`;
@@ -186,9 +283,9 @@ function promptExplain(question, userAnswer, isCorrect) {
 {"judged":"对/错","explanation":"讲解：先点明对错，再讲清知识点本身，语气像朋友聊天，不要应试腔","followups":["建议的追问方向1","建议的追问方向2"]}`;
 }
 
-function promptChat(question, history) {
+function promptChat(question, history, nickname = '小问') {
   const ctx = history.slice(-8).map(h => `${h.role === 'user' ? '用户' : '老师'}：${h.content}`).join('\n');
-  return `你是陪练老师「小问」。用户正在练习这道题：
+  return `你是陪练老师「${nickname || '小问'}」。用户正在练习这道题：
 题干：${question.stem}
 选项：${(question.options || []).join(' / ')}
 正确答案：${question.answer}
@@ -209,20 +306,48 @@ function normalizeQuestion(q) {
   if (!Array.isArray(options)) options = [];
   return { ...q, options };
 }
+function parseTags(raw) {
+  try {
+    const a = JSON.parse(raw || '[]');
+    return Array.isArray(a) ? a.filter(t => typeof t === 'string') : [];
+  } catch { return []; }
+}
+const ERROR_TAGS = ['概念不清', '计算失误', '审题偏差', '纯手滑'];
+function cleanTags(value) {
+  return (Array.isArray(value) ? value : [])
+    .filter(t => typeof t === 'string' && ERROR_TAGS.includes(t)).slice(0, 3);
+}
+
+// 记录当前领域的做题进度（每次出题都更新，重新进入时接着练）
+function saveProgress(domainId, nodeId, questionId, difficulty) {
+  db.prepare(`INSERT INTO progress (domain_id, node_id, question_id, difficulty, updated_at) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(domain_id) DO UPDATE SET node_id = excluded.node_id, question_id = excluded.question_id,
+      difficulty = excluded.difficulty, answered = 0, updated_at = excluded.updated_at`)
+    .run(domainId, nodeId, questionId, difficulty, now());
+}
+
+// 下发给客户端的题目不带答案/解析，避免提交前从数据里看到对错
+function publicQuestion(q) {
+  if (!q) return q;
+  const { answer, explanation, ...rest } = normalizeQuestion(q);
+  return rest;
+}
 
 // ---------- 鉴权（单用户） ----------
-function hashPassword(pw) {
+// 原则：不阻塞事件循环；比较凭据不泄露时间差；错误不区分账号状态。
+const scryptAsync = promisify(crypto.scrypt);
+const DUMMY_SALT = crypto.randomBytes(16).toString('hex');
+async function hashPassword(pw) {
   const salt = crypto.randomBytes(16).toString('hex');
-  const hash = crypto.scryptSync(pw, salt, 64).toString('hex');
+  const hash = (await scryptAsync(pw, salt, 64)).toString('hex');
   return `${salt}:${hash}`;
 }
-function verifyPassword(pw, stored) {
-  if (!stored) return false;
-  const [salt, hash] = stored.split(':');
-  if (!salt || !hash) return false;
-  const calc = crypto.scryptSync(pw, salt, 64).toString('hex');
-  const a = Buffer.from(calc, 'hex'), b = Buffer.from(hash, 'hex');
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+async function verifyPassword(pw, stored) {
+  // 无密码哈希时也做等价运算，避免响应时间差被用于探测初始化状态
+  const [salt, hash] = (stored || `${DUMMY_SALT}:${'0'.repeat(128)}`).split(':');
+  const calc = (await scryptAsync(pw, salt || DUMMY_SALT, 64)).toString('hex');
+  const a = Buffer.from(calc, 'hex'), b = Buffer.from(hash || '', 'hex');
+  return Boolean(stored) && a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 function makeToken() {
   const token = crypto.randomBytes(24).toString('hex');
@@ -232,20 +357,189 @@ function makeToken() {
 function authed(req) {
   const auth = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-  return token && token === getSetting('token');
+  const expected = getSetting('token') || '';
+  if (!token || !expected) return false;
+  const a = Buffer.from(token), b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-// ---------- 工具 ----------
-function json(res, code, data) {
+// ---------- 工具：边界校验与限流 ----------
+class HttpError extends Error {
+  constructor(code, message) { super(message); this.code = code; }
+}
+function fail(code, message) { throw new HttpError(code, message); }
+function intIn(value, min, max, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.trunc(n))) : fallback;
+}
+function text(value, max, fallback = '') {
+  return typeof value === 'string' ? value.slice(0, max) : fallback;
+}
+function json(res, code, data, headers = {}) {
   const body = JSON.stringify(data);
-  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...headers });
   res.end(body);
 }
 function now() { return new Date().toISOString(); }
-async function readBody(req) {
+
+// 滑动窗口限流：按「分组 + 连接来源 IP」计数，匿名接口和模型接口都需要
+const rateBuckets = new Map();
+function allow(req, group, max, windowMs) {
+  const key = `${group}:${req.socket.remoteAddress || 'unknown'}`;
+  const t = Date.now();
+  const hits = (rateBuckets.get(key) || []).filter(x => x > t - windowMs);
+  if (hits.length >= max) { rateBuckets.set(key, hits); return false; }
+  hits.push(t);
+  rateBuckets.set(key, hits);
+  if (rateBuckets.size > 2000) {
+    for (const [k, v] of rateBuckets) if (!v.length || v[v.length - 1] < t - windowMs) rateBuckets.delete(k);
+  }
+  return true;
+}
+function limitOrThrow(req, group, max, windowMs) {
+  if (!allow(req, group, max, windowMs)) fail(429, '请求过于频繁，请稍后再试');
+}
+async function readBody(req, limit = 1e6) {
   let raw = '';
-  for await (const chunk of req) { raw += chunk; if (raw.length > 1e6) break; }
-  try { return raw ? JSON.parse(raw) : {}; } catch { return null; }
+  for await (const chunk of req) {
+    raw += chunk;
+    if (raw.length > limit) fail(413, '请求内容过大');
+  }
+  if (!raw) return {};
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch { fail(400, '请求格式错误'); }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) fail(400, '请求格式错误');
+  return parsed;
+}
+// 多步写库必须原子提交，避免 await 交错导致半截状态或丢失更新
+function transaction(fn) {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const result = fn();
+    db.exec('COMMIT');
+    return result;
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch { /* 已回滚 */ }
+    throw e;
+  }
+}
+function purgeNodes(domainId) {
+  db.prepare('DELETE FROM chat_turn WHERE question_id IN (SELECT id FROM question WHERE node_id IN (SELECT id FROM node WHERE domain_id = ?))').run(domainId);
+  db.prepare('DELETE FROM mistake WHERE node_id IN (SELECT id FROM node WHERE domain_id = ?)').run(domainId);
+  db.prepare('DELETE FROM attempt WHERE node_id IN (SELECT id FROM node WHERE domain_id = ?)').run(domainId);
+  db.prepare('DELETE FROM question WHERE node_id IN (SELECT id FROM node WHERE domain_id = ?)').run(domainId);
+  db.prepare('DELETE FROM review_slot WHERE node_id IN (SELECT id FROM node WHERE domain_id = ?)').run(domainId);
+  db.prepare('DELETE FROM progress WHERE domain_id = ?').run(domainId);
+  db.prepare('DELETE FROM node WHERE domain_id = ?').run(domainId);
+}
+// ---------- 外部题库导入（munger-kb → domain/node/question） ----------
+// 幂等：以 source_key 判定已存在对象；只增量补缺，绝不删除用户已有作答/进度。
+const BANK_DOMAIN_KEY = 'munger-kb://domain/munger-models';
+function importQuestionBank(items) {
+  if (!Array.isArray(items) || items.length === 0) fail(400, '题库为空');
+  const max = 5000;
+  if (items.length > max) fail(400, `单次最多导入 ${max} 题`);
+  const stats = { received: items.length, domains_created: 0, nodes_created: 0, nodes_reused: 0, questions_created: 0, questions_skipped: 0, invalid: 0 };
+
+  transaction(() => {
+    let domain = db.prepare('SELECT * FROM domain WHERE source_key = ?').get(BANK_DOMAIN_KEY);
+    if (!domain) {
+      const r = db.prepare("INSERT INTO domain (name, source, status, level, created_at, source_key) VALUES (?, 'munger-kb', 'ready', '能上手用', ?, ?)")
+        .run('芒格思维模型', now(), BANK_DOMAIN_KEY);
+      domain = { id: r.lastInsertRowid };
+      stats.domains_created = 1;
+    }
+    const domainId = domain.id;
+    const facetCache = new Map();
+    const nodeCache = new Map();
+
+    // 现有题按 source_key 建集合，避免重复插入
+    const existingQ = new Set(db.prepare("SELECT source_key FROM question WHERE source_key LIKE 'munger-kb://%'").all().map(r => r.source_key));
+
+    for (const raw of items) {
+      if (!raw || typeof raw !== 'object') { stats.invalid++; continue; }
+      const bankId = typeof raw.bank_id === 'string' ? raw.bank_id.slice(0, 120) : '';
+      const domainName = typeof raw.domain_name === 'string' ? raw.domain_name.trim().slice(0, 120) : '';
+      const nodeName = typeof raw.node_name === 'string' ? raw.node_name.trim().slice(0, 120) : '';
+      const stem = typeof raw.stem === 'string' ? raw.stem.trim().slice(0, 1000) : '';
+      const answer = typeof raw.answer === 'string' ? raw.answer.trim().slice(0, 300) : '';
+      let options = raw.options;
+      if (typeof options === 'string') { try { options = JSON.parse(options); } catch { options = []; } }
+      options = Array.isArray(options) ? options.filter(x => typeof x === 'string').slice(0, 6) : [];
+      if (!bankId || !nodeName || !stem || !answer || options.length < 2 || !options.includes(answer)) { stats.invalid++; continue; }
+
+      // 学科知识点（facet）：按 domain_name 建
+      const facetKey = `munger-kb://facet/${domainName}`;
+      let facetId = facetCache.get(facetKey);
+      if (facetId === undefined) {
+        const found = db.prepare('SELECT id FROM node WHERE domain_id = ? AND source_key = ?').get(domainId, facetKey);
+        if (found) {
+          facetId = found.id;
+          stats.nodes_reused++;
+        } else {
+          const r = db.prepare("INSERT INTO node (domain_id, parent_id, name, cognitive_level, mastery, status, created_at, source_key) VALUES (?, NULL, ?, 2, 0, 'active', ?, ?)")
+            .run(domainId, domainName || '未分类', now(), facetKey);
+          facetId = r.lastInsertRowid;
+          stats.nodes_created++;
+        }
+        facetCache.set(facetKey, facetId);
+      }
+
+      // 模型知识点：挂在学科下；同名模型跨题型复用同一节点
+      const stableNodeKey = `munger-kb://model/${nodeName}`;
+      let nodeId = nodeCache.get(stableNodeKey);
+      if (nodeId === undefined) {
+        const found = db.prepare('SELECT id FROM node WHERE domain_id = ? AND source_key = ?').get(domainId, stableNodeKey);
+        if (found) {
+          nodeId = found.id;
+          stats.nodes_reused++;
+        } else {
+          const r = db.prepare("INSERT INTO node (domain_id, parent_id, name, cognitive_level, mastery, status, created_at, source_key) VALUES (?, ?, ?, 1, 0, 'active', ?, ?)")
+            .run(domainId, facetId, nodeName, now(), stableNodeKey);
+          nodeId = r.lastInsertRowid;
+          stats.nodes_created++;
+        }
+        nodeCache.set(stableNodeKey, nodeId);
+      }
+
+      const qKey = `munger-kb://q/${bankId}`;
+      if (existingQ.has(qKey)) { stats.questions_skipped++; continue; }
+      const type = raw.type === 'judge' ? 'judge' : 'single';
+      const difficulty = intIn(raw.difficulty, 1, 5, 1);
+      const explanation = typeof raw.explanation === 'string' ? raw.explanation.slice(0, 4000) : '';
+      const sourceUrl = typeof raw.source_url === 'string' ? raw.source_url.slice(0, 500) : '';
+      const sourceType = typeof raw.source_type === 'string' ? raw.source_type.slice(0, 40) : '';
+      db.prepare('INSERT INTO question (node_id, type, difficulty, stem, options, answer, explanation, model, prompt_ver, created_at, source_key, source_url, source_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(nodeId, type, difficulty, stem, JSON.stringify(options), answer, explanation,
+          typeof raw.model === 'string' ? raw.model.slice(0, 80) : 'munger-kb',
+          typeof raw.prompt_ver === 'string' ? raw.prompt_ver.slice(0, 40) : 'bank-v1',
+          now(), qKey, sourceUrl, sourceType);
+      existingQ.add(qKey);
+      stats.questions_created++;
+    }
+  });
+  return stats;
+}
+
+function questionBankStats() {
+  const q = db.prepare("SELECT COUNT(*) AS n FROM question WHERE source_key LIKE 'munger-kb://%'").get().n;
+  const nodes = db.prepare("SELECT COUNT(*) AS n FROM node WHERE source_key LIKE 'munger-kb://model/%'").get().n;
+  const facets = db.prepare("SELECT COUNT(*) AS n FROM node WHERE source_key LIKE 'munger-kb://facet/%'").get().n;
+  const domain = db.prepare('SELECT id, name FROM domain WHERE source_key = ?').get(BANK_DOMAIN_KEY) || null;
+  const byType = db.prepare("SELECT source_type, COUNT(*) AS n FROM question WHERE source_key LIKE 'munger-kb://%' GROUP BY source_type").all();
+  return { domain, facets, nodes, questions: q, by_type: byType };
+}
+
+// 同一知识点的出题串行化：防止并发请求同时判定缓存未命中，生成重复题
+const nodeLocks = new Map();
+async function withNodeLock(nodeId, fn) {
+  const prev = nodeLocks.get(nodeId) || Promise.resolve();
+  let release;
+  const current = new Promise(resolve => { release = resolve; });
+  nodeLocks.set(nodeId, current);
+  await prev;
+  try { return await fn(); }
+  finally { release(); if (nodeLocks.get(nodeId) === current) nodeLocks.delete(nodeId); }
 }
 
 // ---------- API 路由 ----------
@@ -256,24 +550,27 @@ routes['GET /api/health'] = (req, res) => json(res, 200, { ok: true, model_confi
 
 // 鉴权
 routes['POST /api/auth/setup'] = async (req, res) => {
+  limitOrThrow(req, 'setup', 5, 10 * 60 * 1000);
   const b = await readBody(req);
-  const pw = String(b.password || '');
-  if (pw.length < 4) return json(res, 400, { error: '密码至少 4 位' });
+  const pw = typeof b.password === 'string' ? b.password : '';
+  if (pw.length < 4 || pw.length > 128) return json(res, 400, { error: '密码需 4~128 位' });
   if (getSetting('password_hash')) return json(res, 409, { error: '密码已设置，请直接登录' });
-  setSetting('password_hash', hashPassword(pw));
+  setSetting('password_hash', await hashPassword(pw));
   const token = makeToken();
   json(res, 200, { ok: true, token });
 };
 routes['POST /api/auth/login'] = async (req, res) => {
+  limitOrThrow(req, 'login', 8, 10 * 60 * 1000);
   const b = await readBody(req);
-  const pw = String(b.password || '');
+  const pw = typeof b.password === 'string' ? b.password.slice(0, 128) : '';
   const stored = getSetting('password_hash');
   if (!stored) return json(res, 400, { error: '尚未设置密码，请先创建' });
-  if (!verifyPassword(pw, stored)) return json(res, 401, { error: '密码错误' });
+  if (!await verifyPassword(pw, stored)) return json(res, 401, { error: '密码错误' });
   const token = makeToken();
   json(res, 200, { ok: true, token });
 };
 routes['POST /api/auth/logout'] = async (req, res) => {
+  if (!authed(req)) return json(res, 401, { error: '未登录' });
   setSetting('token', '');
   json(res, 200, { ok: true });
 };
@@ -291,6 +588,8 @@ routes['GET /api/settings'] = (req, res) => {
     voice_pref: getSetting('voice_pref'),
     model: {
       base_url: c.base_url ? '已配置' : '',
+      base_url_set: Boolean(c.base_url),
+      api_key_set: Boolean(c.api_key),
       chat_model: c.chat_model,
       fast_model: c.fast_model,
       configured: modelAvailable(),
@@ -300,9 +599,40 @@ routes['GET /api/settings'] = (req, res) => {
 routes['POST /api/settings'] = async (req, res) => {
   if (!authed(req)) return json(res, 401, { error: '未登录' });
   const b = await readBody(req);
-  for (const k of ['nickname', 'interests', 'font_scale', 'motion', 'voice_pref', 'llm_base_url', 'llm_api_key', 'llm_chat_model', 'llm_fast_model']) {
-    if (k in b) setSetting(k, b[k]);
+  const patch = {};
+  if ('nickname' in b) patch.nickname = text(b.nickname, 24);
+  if ('interests' in b) patch.interests = text(b.interests, 500);
+  if ('font_scale' in b) {
+    const v = String(b.font_scale);
+    if (!['1', '2', '3', '4', '5'].includes(v)) fail(400, '字号不合法');
+    patch.font_scale = v;
   }
+  if ('motion' in b) {
+    const v = String(b.motion);
+    if (!['1', '2'].includes(v)) fail(400, '动效档位不合法');
+    patch.motion = v;
+  }
+  if ('voice_pref' in b) patch.voice_pref = text(b.voice_pref, 20, 'cloud');
+  // 空输入框表示「保持原值」，避免重新打开设置页后误清空密钥/地址；
+  // 需要彻底清除时传 clear_llm: true。
+  if (b.clear_llm === true) {
+    Object.assign(patch, { llm_base_url: '', llm_api_key: '', llm_chat_model: '', llm_fast_model: '' });
+  } else {
+    if ('llm_base_url' in b) {
+      const v = String(b.llm_base_url || '').trim();
+      if (v) patch.llm_base_url = await checkBaseUrl(v);
+    }
+    if ('llm_api_key' in b) {
+      const v = text(b.llm_api_key, 500).trim();
+      if (v) patch.llm_api_key = v;
+    }
+    if ('llm_chat_model' in b) {
+      const v = text(b.llm_chat_model, 100).trim();
+      if (v) patch.llm_chat_model = v;
+    }
+    if ('llm_fast_model' in b) patch.llm_fast_model = text(b.llm_fast_model, 100).trim();
+  }
+  for (const [k, v] of Object.entries(patch)) setSetting(k, v);
   json(res, 200, { ok: true });
 };
 
@@ -319,21 +649,21 @@ routes['GET /api/domains'] = (req, res) => {
 routes['POST /api/domains'] = async (req, res) => {
   if (!authed(req)) return json(res, 401, { error: '未登录' });
   const b = await readBody(req);
-  const name = String(b.name || '').trim();
+  const name = typeof b.name === 'string' ? b.name.trim().slice(0, 120) : '';
   if (!name) return json(res, 400, { error: '领域名称不能为空' });
-  const r = db.prepare('INSERT INTO domain (name, source, status, created_at) VALUES (?, ?, ?, ?)').run(name, 'manual', 'ready', now());
+  const allowedLevels = ['没学过', '学过一点', '能上手用'];
+  const level = allowedLevels.includes(b.level) ? b.level : '没学过';
+  const r = db.prepare('INSERT INTO domain (name, source, status, level, created_at) VALUES (?, ?, ?, ?, ?)')
+    .run(name, 'manual', 'ready', level, now());
   json(res, 200, { ok: true, id: r.lastInsertRowid });
 };
 routes['DELETE /api/domains/:id'] = (req, res, m) => {
   if (!authed(req)) return json(res, 401, { error: '未登录' });
-  const id = Number(m.id);
-  db.prepare('DELETE FROM chat_turn WHERE question_id IN (SELECT id FROM question WHERE node_id IN (SELECT id FROM node WHERE domain_id = ?))').run(id);
-  db.prepare('DELETE FROM mistake WHERE node_id IN (SELECT id FROM node WHERE domain_id = ?)').run(id);
-  db.prepare('DELETE FROM attempt WHERE node_id IN (SELECT id FROM node WHERE domain_id = ?)').run(id);
-  db.prepare('DELETE FROM question WHERE node_id IN (SELECT id FROM node WHERE domain_id = ?)').run(id);
-  db.prepare('DELETE FROM review_slot WHERE node_id IN (SELECT id FROM node WHERE domain_id = ?)').run(id);
-  db.prepare('DELETE FROM node WHERE domain_id = ?').run(id);
-  db.prepare('DELETE FROM domain WHERE id = ?').run(id);
+  const id = intIn(m.id, 1, 2147483647, 0);
+  transaction(() => {
+    purgeNodes(id);
+    db.prepare('DELETE FROM domain WHERE id = ?').run(id);
+  });
   json(res, 200, { ok: true });
 };
 routes['GET /api/domains/:id'] = (req, res, m) => {
@@ -342,111 +672,221 @@ routes['GET /api/domains/:id'] = (req, res, m) => {
   const d = db.prepare('SELECT * FROM domain WHERE id = ?').get(id);
   if (!d) return json(res, 404, { error: '领域不存在' });
   const nodes = db.prepare('SELECT * FROM node WHERE domain_id = ? ORDER BY parent_id NULLS FIRST, id').all(id);
-  json(res, 200, { domain: d, nodes });
+  const progress = db.prepare('SELECT node_id, question_id, difficulty, answered, updated_at FROM progress WHERE domain_id = ?').get(id) || null;
+  json(res, 200, { domain: d, nodes, progress });
 };
 
 // 拆知识清单（M1 核心，构建过程由前端逐段渲染）
 routes['POST /api/domains/:id/build'] = async (req, res, m) => {
   if (!authed(req)) return json(res, 401, { error: '未登录' });
-  const domainId = Number(m.id);
+  limitOrThrow(req, 'build', 5, 60 * 1000);
+  const domainId = intIn(m.id, 1, 2147483647, 0);
+  const d = db.prepare('SELECT * FROM domain WHERE id = ?').get(domainId);
+  if (!d) return json(res, 404, { error: '领域不存在' });
   const b = await readBody(req);
-  const levelDesc = String(b.level || '');
+  // 前端传值优先；旧调用未传时回退到创建领域时选择的起始基础
+  const levelDesc = text(b.level, 200) || d.level || '';
   if (!modelAvailable()) return json(res, 500, { error: '模型未配置：请先在设置页填写模型配置' });
+  let data;
   try {
-    const content = await llmChat([{ role: 'user', content: promptBuildList(b.domain_name || '', levelDesc) }], { json: true });
-    const data = JSON.parse(content);
-    db.prepare('DELETE FROM node WHERE domain_id = ?').run(domainId);
-    let pid = null;
-    for (const facet of (data.facets || [])) {
+    const content = await llmChat([{ role: 'user', content: promptBuildList(d.name, levelDesc) }], { json: true });
+    data = JSON.parse(content);
+  } catch (e) {
+    if (e instanceof HttpError) throw e;
+    return json(res, 502, { error: '拆解失败：模型输出不可用，请重试' });
+  }
+  if (!data || typeof data !== 'object' || !Array.isArray(data.facets)) return json(res, 502, { error: '拆解失败：模型输出格式异常' });
+  // 模型输出不可信：限制数量与字段类型，清洗后再落库
+  const cleaned = [];
+  for (const f of data.facets.slice(0, 8)) {
+    if (!f || typeof f !== 'object') continue;
+    const name = typeof f.name === 'string' ? f.name.trim().slice(0, 80) : '';
+    const points = (Array.isArray(f.points) ? f.points : []).slice(0, 12).map(p => ({
+      name: typeof p?.name === 'string' ? p.name.trim().slice(0, 80) : '',
+      cognitive_level: intIn(p?.cognitive_level, 1, 4, 1),
+    })).filter(p => p.name);
+    if (name && points.length) cleaned.push({ name, points });
+  }
+  if (!cleaned.length) return json(res, 502, { error: '拆解失败：模型输出的知识清单为空' });
+  const nodes = transaction(() => {
+    purgeNodes(domainId);
+    for (const facet of cleaned) {
       const fr = db.prepare('INSERT INTO node (domain_id, parent_id, name, cognitive_level, created_at) VALUES (?, NULL, ?, 2, ?)').run(domainId, facet.name, now());
-      pid = fr.lastInsertRowid;
-      for (const point of (facet.points || [])) {
+      for (const point of facet.points) {
         db.prepare('INSERT INTO node (domain_id, parent_id, name, cognitive_level, created_at) VALUES (?, ?, ?, ?, ?)')
-          .run(domainId, pid, point.name, Math.min(4, Math.max(1, Number(point.cognitive_level) || 1)), now());
+          .run(domainId, fr.lastInsertRowid, point.name, point.cognitive_level, now());
       }
     }
-    db.prepare('UPDATE domain SET status = ? WHERE id = ?').run('ready', domainId);
-    const nodes = db.prepare('SELECT * FROM node WHERE domain_id = ? ORDER BY parent_id NULLS FIRST, id').all(domainId);
-    json(res, 200, { ok: true, facets: data.facets, nodes });
-  } catch (e) {
-    json(res, 500, { error: `拆解失败：${e.message}` });
-  }
+    db.prepare("UPDATE domain SET status = 'ready' WHERE id = ?").run(domainId);
+    return db.prepare('SELECT * FROM node WHERE domain_id = ? ORDER BY parent_id NULLS FIRST, id').all(domainId);
+  });
+  json(res, 200, { ok: true, facets: cleaned, nodes });
 };
 
 // 节点维护
 routes['POST /api/nodes'] = async (req, res) => {
   if (!authed(req)) return json(res, 401, { error: '未登录' });
   const b = await readBody(req);
+  const domainId = intIn(b.domain_id, 1, 2147483647, 0);
+  if (!db.prepare('SELECT 1 FROM domain WHERE id = ?').get(domainId)) fail(404, '领域不存在');
+  const name = typeof b.name === 'string' ? b.name.trim().slice(0, 120) : '';
+  if (!name) fail(400, '知识点名称不能为空');
+  let parentId = null;
+  if (b.parent_id !== null && b.parent_id !== undefined && b.parent_id !== '') {
+    parentId = intIn(b.parent_id, 1, 2147483647, 0);
+    if (!db.prepare('SELECT 1 FROM node WHERE id = ? AND domain_id = ?').get(parentId, domainId)) fail(400, '父知识点不存在');
+  }
   const r = db.prepare('INSERT INTO node (domain_id, parent_id, name, cognitive_level, created_at) VALUES (?, ?, ?, ?, ?)')
-    .run(Number(b.domain_id), b.parent_id ? Number(b.parent_id) : null, String(b.name || ''), Number(b.level) || 1, now());
+    .run(domainId, parentId, name, intIn(b.level, 1, 4, 1), now());
   json(res, 200, { ok: true, id: r.lastInsertRowid });
 };
 routes['DELETE /api/nodes/:id'] = (req, res, m) => {
   if (!authed(req)) return json(res, 401, { error: '未登录' });
-  const id = Number(m.id);
-  db.prepare('DELETE FROM chat_turn WHERE question_id IN (SELECT id FROM question WHERE node_id = ?)').run(id);
-  db.prepare('DELETE FROM mistake WHERE node_id = ?').run(id);
-  db.prepare('DELETE FROM attempt WHERE node_id = ?').run(id);
-  db.prepare('DELETE FROM question WHERE node_id = ?').run(id);
-  db.prepare('DELETE FROM review_slot WHERE node_id = ?').run(id);
-  db.prepare('DELETE FROM node WHERE id = ?').run(id);
+  const id = intIn(m.id, 1, 2147483647, 0);
+  // 删除父节点时一并处理所有后代，避免孤儿节点与悬挂引用
+  const ids = db.prepare(`WITH RECURSIVE sub(id) AS (
+    SELECT ? UNION ALL SELECT n.id FROM node n JOIN sub ON n.parent_id = sub.id
+  ) SELECT id FROM sub`).all(id).map(r => r.id);
+  const ph = ids.map(() => '?').join(',');
+  transaction(() => {
+    db.prepare(`DELETE FROM chat_turn WHERE question_id IN (SELECT id FROM question WHERE node_id IN (${ph}))`).run(...ids);
+    db.prepare(`DELETE FROM mistake WHERE node_id IN (${ph})`).run(...ids);
+    db.prepare(`DELETE FROM attempt WHERE node_id IN (${ph})`).run(...ids);
+    db.prepare(`DELETE FROM question WHERE node_id IN (${ph})`).run(...ids);
+    db.prepare(`DELETE FROM review_slot WHERE node_id IN (${ph})`).run(...ids);
+    db.prepare(`DELETE FROM progress WHERE node_id IN (${ph})`).run(...ids);
+    db.prepare(`DELETE FROM node WHERE id IN (${ph})`).run(...ids);
+  });
   json(res, 200, { ok: true });
 };
 
-// 出题（落库缓存，同节点同难度复用）
+// 外部题库管理：需鉴权；导入幂等，仅补缺不破坏已有数据
+routes['GET /api/bank/stats'] = (req, res) => {
+  if (!authed(req)) return json(res, 401, { error: '未登录' });
+  json(res, 200, questionBankStats());
+};
+routes['POST /api/bank/import'] = async (req, res) => {
+  if (!authed(req)) return json(res, 401, { error: '未登录' });
+  limitOrThrow(req, 'bank-import', 10, 60 * 1000);
+  const b = await readBody(req, 8e6); // 题库文件较大，放宽到 8MB
+  const items = Array.isArray(b.questions) ? b.questions : [];
+  const stats = importQuestionBank(items);
+  json(res, 200, { ok: true, stats, bank: questionBankStats() });
+};
+
+// 按 ID 取单题（公开字段）：供地图/复习/错题本直达指定题目或知识点
+routes['GET /api/questions/:id'] = (req, res, m) => {
+  if (!authed(req)) return json(res, 401, { error: '未登录' });
+  const q = normalizeQuestion(db.prepare(`SELECT q.*, n.domain_id FROM question q
+    JOIN node n ON n.id = q.node_id WHERE q.id = ?`).get(intIn(m.id, 1, 2147483647, 0)));
+  if (!q) return json(res, 404, { error: '题目不存在' });
+  json(res, 200, { question: publicQuestion(q) });
+};
+
+// 出题（默认落库缓存复用；force_new 时跳过已见过的题，保证「下一题」是新题）
 routes['POST /api/questions'] = async (req, res) => {
   if (!authed(req)) return json(res, 401, { error: '未登录' });
   const b = await readBody(req);
-  const node = db.prepare('SELECT * FROM node WHERE id = ?').get(Number(b.node_id));
+  const node = db.prepare('SELECT * FROM node WHERE id = ?').get(intIn(b.node_id, 1, 2147483647, 0));
   if (!node) return json(res, 404, { error: '知识点不存在' });
-  const difficulty = Math.min(5, Math.max(1, Number(b.difficulty) || 1));
-  const cached = db.prepare('SELECT * FROM question WHERE node_id = ? AND difficulty = ? LIMIT 1').get(node.id, difficulty);
-  if (cached) return json(res, 200, { question: normalizeQuestion(cached), cached: true });
-  if (!modelAvailable()) return json(res, 500, { error: '模型未配置：请先在设置页填写模型配置' });
-  try {
-    const content = await llmChat([{ role: 'user', content: promptMakeQuestion(node.name, node.cognitive_level, difficulty, getSetting('interests') || '') }], { json: true });
-    const q = JSON.parse(content);
-    const r = db.prepare('INSERT INTO question (node_id, type, difficulty, stem, options, answer, explanation, model, prompt_ver, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(node.id, q.type || 'single', difficulty, q.stem || '', JSON.stringify(q.options || []), q.answer || '', q.explanation || '', llmConfig().chat_model, PROMPT_VER, now());
-    json(res, 200, { question: normalizeQuestion(db.prepare('SELECT * FROM question WHERE id = ?').get(r.lastInsertRowid)), cached: false });
-  } catch (e) {
-    json(res, 500, { error: `出题失败：${e.message}` });
-  }
+  const difficulty = intIn(b.difficulty, 1, 5, 1);
+  const forceNew = b.force_new === true || b.force_new === 'true';
+  limitOrThrow(req, forceNew ? 'question-new' : 'question', forceNew ? 12 : 40, 60 * 1000);
+  const excludeIds = (Array.isArray(b.exclude_ids) ? b.exclude_ids : [])
+    .map(Number).filter(n => Number.isInteger(n) && n > 0).slice(0, 20);
+  await withNodeLock(node.id, async () => {
+    // 普通出题沿用缓存；「下一题」优先复用库中还没见过的题，避免重复调用模型
+    const cached = db.prepare('SELECT * FROM question WHERE node_id = ? AND difficulty = ? ORDER BY id').all(node.id, difficulty)
+      .find(q => !excludeIds.includes(q.id));
+    if (cached && (!forceNew || excludeIds.length > 0)) {
+      transaction(() => saveProgress(node.domain_id, node.id, cached.id, difficulty));
+      return json(res, 200, { question: publicQuestion(cached), cached: true });
+    }
+    if (!modelAvailable()) return json(res, 500, { error: '模型未配置：请先在设置页填写模型配置' });
+    const count = db.prepare('SELECT COUNT(*) AS n FROM question WHERE node_id = ?').get(node.id).n;
+    if (count >= 200) return json(res, 409, { error: '该知识点题目已达上限' });
+    let row;
+    try {
+      const placeholders = excludeIds.map(() => '?').join(',');
+      const avoidStems = placeholders
+        ? db.prepare(`SELECT stem FROM question WHERE id IN (${placeholders})`).all(...excludeIds).map(r => r.stem).filter(Boolean).slice(0, 8)
+        : [];
+      const content = await llmChat([{ role: 'user', content: promptMakeQuestion(node.name, node.cognitive_level, difficulty, getSetting('interests') || '', avoidStems) }], { json: true });
+      const q = JSON.parse(content);
+      // 模型输出不可信：结构、数量、长度都要校验后再落库
+      if (!q || typeof q !== 'object' || typeof q.stem !== 'string' || !q.stem.trim()) throw new Error('invalid question');
+      const type = q.type === 'judge' ? 'judge' : 'single';
+      const rawOptions = (Array.isArray(q.options) ? q.options : [])
+        .filter(o => typeof o === 'string' && o.trim()).slice(0, 6)
+        .map(o => o.trim().slice(0, 300));
+      const options = type === 'judge' ? ['正确', '错误'] : [...new Set(rawOptions)];
+      const answer = typeof q.answer === 'string' ? q.answer.trim().slice(0, 300) : '';
+      if (options.length < 2 || !answer) throw new Error('invalid options or answer');
+      if (type === 'judge' && !['正确', '错误', 'A', 'B'].includes(answer)) throw new Error('invalid judge answer');
+      // 答案必须能定位到某个选项，否则这道题永远判错；这类脏数据宁可不落库
+      if (answerIndex(answer, options, true) < 0) throw new Error('answer not in options');
+      row = transaction(() => {
+        const r = db.prepare('INSERT INTO question (node_id, type, difficulty, stem, options, answer, explanation, model, prompt_ver, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(node.id, type, difficulty, q.stem.slice(0, 1000), JSON.stringify(options), answer,
+            typeof q.explanation === 'string' ? q.explanation.slice(0, 4000) : '', llmConfig().chat_model, PROMPT_VER, now());
+        const inserted = db.prepare('SELECT * FROM question WHERE id = ?').get(r.lastInsertRowid);
+        saveProgress(node.domain_id, node.id, inserted.id, difficulty);
+        return inserted;
+      });
+    } catch (e) {
+      if (e instanceof HttpError) throw e;
+      return json(res, 502, { error: '出题失败：模型输出不可用，请重试' });
+    }
+    return json(res, 200, { question: publicQuestion(row), cached: false });
+  });
 };
 
-// ---------- 答案归一化：兼容「字母」「选项原文」「数字序号」三种存储/提交形式 ----------
-function normalizeAnswerKey(answer, options) {
-  const a = String(answer ?? '').trim().toUpperCase();
-  if (!a) return '';
-  // 原文形式：在选项列表中找到对应项，转成字母
-  const idx = (options || []).findIndex(o => String(o).trim().toUpperCase() === a);
-  if (idx >= 0) return String.fromCharCode(65 + idx);
-  // 已是字母形式
-  if (/^[A-Z]$/.test(a)) return a;
-  // 数字序号（1 起）
-  if (/^\d+$/.test(a)) return String.fromCharCode(65 + Math.min(25, Number(a) - 1));
-  return a;
+// ---------- 答案定位：兼容「字母」「选项原文」「数字序号」三种存储/提交形式 ----------
+// preferLetter=true 用于题库答案（模型输出约定为字母），false 用于用户提交（前端传选项原文）。
+// 这样即使某个选项文本恰好是 "B"，也不会把字母答案和选项原文混为一谈。
+function answerIndex(answer, options, preferLetter = true) {
+  const raw = String(answer ?? '').trim();
+  const opts = Array.isArray(options) ? options : [];
+  if (!raw || !opts.length) return -1;
+  const exact = opts.findIndex(o => String(o).trim() === raw);
+  if (!preferLetter && exact >= 0) return exact;
+  const allSingleLetters = opts.every(o => /^[A-Za-z]$/.test(String(o).trim()));
+  if (!allSingleLetters && /^[A-Za-z]$/.test(raw)) {
+    const i = raw.toUpperCase().charCodeAt(0) - 65;
+    if (i >= 0 && i < opts.length) return i;
+  }
+  if (exact >= 0) return exact;
+  const loose = opts.findIndex(o => String(o).trim().toUpperCase() === raw.toUpperCase());
+  if (loose >= 0) return loose;
+  if (/^\d+$/.test(raw)) {
+    const n = Number(raw);
+    if (n >= 1 && n <= opts.length) return n - 1;
+  }
+  return -1;
 }
 
 // 作答判定 + 掌握度 + 错题 + 复习调度
 routes['POST /api/attempts'] = async (req, res) => {
   if (!authed(req)) return json(res, 401, { error: '未登录' });
+  limitOrThrow(req, 'attempt', 60, 60 * 1000);
   const b = await readBody(req);
-  const q = normalizeQuestion(db.prepare('SELECT * FROM question WHERE id = ?').get(Number(b.question_id)));
+  const q = normalizeQuestion(db.prepare('SELECT * FROM question WHERE id = ?').get(intIn(b.question_id, 1, 2147483647, 0)));
   if (!q) return json(res, 404, { error: '题目不存在' });
-  const answerGiven = String(b.answer ?? '');
-  const isCorrect = normalizeAnswerKey(answerGiven, q.options) === normalizeAnswerKey(q.answer, q.options) ? 1 : 0;
-  const errorTags = Array.isArray(b.error_tags) ? b.error_tags.slice(0, 3) : [];
-  db.prepare('INSERT INTO attempt (question_id, node_id, answer_given, is_correct, duration_ms, error_tags, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(q.id, q.node_id, answerGiven, isCorrect, Number(b.duration_ms) || 0, JSON.stringify(errorTags), now());
+  const answerGiven = text(b.answer, 500);
+  const durationMs = intIn(b.duration_ms, 0, 86400000, 0);
+  const isCorrect = answerIndex(answerGiven, q.options, false) === answerIndex(q.answer, q.options, true) ? 1 : 0;
+  const errorTags = cleanTags(b.error_tags);
 
-  // 讲解（模型可用时生成，失败则用规则兜底文案）
-  let judged = null, explanation = '', followups = [];
+  // 讲解先生成（含 await），写库阶段不留跨 await 的读-改-写窗口
+  let explanation = '', followups = [];
   if (modelAvailable()) {
     try {
       const content = await llmChat([{ role: 'user', content: promptExplain(q, answerGiven, isCorrect) }], { json: true });
       const parsed = JSON.parse(content);
-      judged = parsed.judged; explanation = parsed.explanation; followups = parsed.followups || [];
+      if (parsed && typeof parsed === 'object') {
+        if (typeof parsed.explanation === 'string') explanation = parsed.explanation.slice(0, 4000);
+        if (Array.isArray(parsed.followups)) followups = parsed.followups.filter(x => typeof x === 'string').slice(0, 3).map(x => x.slice(0, 200));
+      }
     } catch { /* 兜底 */ }
   }
   if (!explanation) {
@@ -456,37 +896,68 @@ routes['POST /api/attempts'] = async (req, res) => {
     followups = ['能再举一个类似的例子吗？', '这个点在实际中怎么用？'];
   }
 
-  // 掌握度更新（答对抬升、答错回落；答对且快加更多）
-  const node = db.prepare('SELECT * FROM node WHERE id = ?').get(q.node_id);
-  const speedBonus = isCorrect && Number(b.duration_ms) > 0 && Number(b.duration_ms) < 15000 ? 0.15 : 0;
-  let mastery = Math.min(1, (node.mastery || 0) + (isCorrect ? 0.2 + speedBonus : -0.25));
-  mastery = Math.max(0, mastery);
-  db.prepare('UPDATE node SET mastery = ? WHERE id = ?').run(mastery, q.node_id);
+  // 所有状态变更原子完成；掌握度/复习间隔在事务内重新读取，避免并发提交丢失更新
+  const state = transaction(() => {
+    const attempt = db.prepare('INSERT INTO attempt (question_id, node_id, answer_given, is_correct, duration_ms, error_tags, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(q.id, q.node_id, answerGiven, isCorrect, durationMs, JSON.stringify(errorTags), now());
+    const attemptNode = db.prepare('SELECT domain_id FROM node WHERE id = ?').get(q.node_id);
+    if (attemptNode) db.prepare('UPDATE progress SET answered = 1 WHERE domain_id = ? AND question_id = ?').run(attemptNode.domain_id, q.id);
 
-  // 错题本（答错入队，答稳自动移出由复习处理）
-  if (!isCorrect) {
-    db.prepare('INSERT OR REPLACE INTO mistake (node_id, question_id, status) VALUES (?, ?, ?)').run(q.node_id, q.id, 'active');
-  }
+    // 错题本：答错入队，答对后自动移出
+    if (!isCorrect) {
+      db.prepare('INSERT OR REPLACE INTO mistake (node_id, question_id, status, resolved_at, error_tags) VALUES (?, ?, ?, NULL, ?)')
+        .run(q.node_id, q.id, 'active', JSON.stringify(errorTags));
+    } else {
+      db.prepare("UPDATE mistake SET status = 'resolved', resolved_at = ? WHERE node_id = ? AND question_id = ? AND status = 'active'").run(now(), q.node_id, q.id);
+    }
 
-  // 间隔复习调度（简化 SRS：答对延长间隔，答错明天再练）
-  const slot = db.prepare('SELECT * FROM review_slot WHERE node_id = ?').get(q.node_id);
-  let interval, ease = slot ? slot.ease : 2.5;
-  if (isCorrect) {
-    interval = slot ? Math.round(slot.interval_days * ease) : 1;
-    ease = Math.min(3.2, ease + 0.15);
-  } else {
-    interval = 1;
-    ease = Math.max(1.3, ease - 0.2);
-  }
-  const due = new Date(Date.now() + interval * 86400000);
-  db.prepare('INSERT INTO review_slot (node_id, due_at, interval_days, ease) VALUES (?, ?, ?, ?) ON CONFLICT(node_id) DO UPDATE SET due_at = excluded.due_at, interval_days = excluded.interval_days, ease = excluded.ease')
-    .run(q.node_id, due.toISOString(), interval, ease);
+    const node = db.prepare('SELECT mastery, domain_id FROM node WHERE id = ?').get(q.node_id);
+    const speedBonus = isCorrect && durationMs > 0 && durationMs < 15000 ? 0.15 : 0;
+    const m = Math.max(0, Math.min(1, (node?.mastery || 0) + (isCorrect ? 0.2 + speedBonus : -0.25)));
+    db.prepare('UPDATE node SET mastery = ? WHERE id = ?').run(m, q.node_id);
 
-  // 领域总掌握度
-  const avg = db.prepare('SELECT AVG(mastery) AS m FROM node WHERE domain_id = ?').get(node.domain_id);
-  db.prepare('UPDATE domain SET overall_mastery = ? WHERE id = ?').run(avg?.m || 0, node.domain_id);
+    // 间隔复习调度（简化 SRS：答对延长间隔，答错明天再练）
+    const slot = db.prepare('SELECT * FROM review_slot WHERE node_id = ?').get(q.node_id);
+    let interval, ease = slot ? slot.ease : 2.5;
+    if (isCorrect) {
+      interval = slot ? Math.round(slot.interval_days * ease) : 1;
+      ease = Math.min(3.2, ease + 0.15);
+    } else {
+      interval = 1;
+      ease = Math.max(1.3, ease - 0.2);
+    }
+    db.prepare('INSERT INTO review_slot (node_id, due_at, interval_days, ease) VALUES (?, ?, ?, ?) ON CONFLICT(node_id) DO UPDATE SET due_at = excluded.due_at, interval_days = excluded.interval_days, ease = excluded.ease')
+      .run(q.node_id, new Date(Date.now() + interval * 86400000).toISOString(), interval, ease);
 
-  json(res, 200, { ok: true, is_correct: isCorrect, explanation, followups, mastery });
+    if (node) {
+      const avg = db.prepare('SELECT AVG(mastery) AS m FROM node WHERE domain_id = ?').get(node.domain_id);
+      db.prepare('UPDATE domain SET overall_mastery = ? WHERE id = ?').run(avg?.m || 0, node.domain_id);
+    }
+    return { mastery: m, attemptId: attempt.lastInsertRowid };
+  });
+
+  // 只有在提交作答后，才告诉前端正确选项在哪
+  const correctIndex = answerIndex(q.answer, q.options, true);
+  json(res, 200, {
+    ok: true, attempt_id: state.attemptId, is_correct: isCorrect,
+    correct_index: correctIndex, explanation, followups, mastery: state.mastery,
+  });
+};
+
+// 作答后补记错因：结果先出、错因后选，保存后同步更新错题本用于按错因聚类
+routes['POST /api/attempts/:id/error-tags'] = async (req, res, m) => {
+  if (!authed(req)) return json(res, 401, { error: '未登录' });
+  const id = intIn(m.id, 1, 2147483647, 0);
+  const b = await readBody(req);
+  const tags = cleanTags(b.error_tags);
+  const attempt = db.prepare('SELECT question_id, node_id FROM attempt WHERE id = ?').get(id);
+  if (!attempt) return json(res, 404, { error: '作答记录不存在' });
+  transaction(() => {
+    db.prepare('UPDATE attempt SET error_tags = ? WHERE id = ?').run(JSON.stringify(tags), id);
+    db.prepare("UPDATE mistake SET error_tags = ? WHERE node_id = ? AND question_id = ? AND status = 'active'")
+      .run(JSON.stringify(tags), attempt.node_id, attempt.question_id);
+  });
+  json(res, 200, { ok: true, error_tags: tags });
 };
 
 // 复习队列（到期知识点）
@@ -503,79 +974,197 @@ routes['GET /api/review'] = (req, res) => {
 routes['GET /api/mistakes'] = (req, res) => {
   if (!authed(req)) return json(res, 401, { error: '未登录' });
   const rows = db.prepare(`
-    SELECT m.*, n.name AS node_name, q.stem, q.type FROM mistake m
+    SELECT m.*, n.name AS node_name, n.domain_id, q.stem, q.type FROM mistake m
     JOIN node n ON n.id = m.node_id
     JOIN question q ON q.id = m.question_id
     WHERE m.status = 'active' ORDER BY m.node_id`).all();
   const byNode = {};
   for (const r of rows) {
-    (byNode[r.node_name] ||= []).push({ question_id: r.question_id, stem: r.stem, type: r.type });
+    (byNode[r.node_name] ||= []).push({
+      question_id: r.question_id, node_id: r.node_id, domain_id: r.domain_id,
+      stem: r.stem, type: r.type, error_tags: parseTags(r.error_tags),
+    });
   }
   json(res, 200, { mistakes: byNode });
 };
 
-// 做题统计：每日 / 每月 / 每年 + 连续打卡 + 作答时长（真实作答数据）
-routes['GET /api/stats'] = (req, res) => {
+// 学习报告（真实作答数据）
+routes['GET /api/report'] = (req, res) => {
   if (!authed(req)) return json(res, 401, { error: '未登录' });
-  const today = new Date();
-
-  // 累计总览
-  const all = db.prepare('SELECT COUNT(*) AS n, SUM(is_correct) AS ok, SUM(duration_ms) AS dur FROM attempt').get();
-
-  // 每日：近 30 天逐日
-  const since30 = new Date(today.getTime() - 29 * 86400000).toISOString();
-  const byDay = db.prepare(`
-    SELECT substr(created_at,1,10) AS d, COUNT(*) AS n, SUM(is_correct) AS ok, SUM(duration_ms) AS dur
-    FROM attempt WHERE created_at >= ? GROUP BY d ORDER BY d`).all(since30);
-
-  // 每月：近 12 个月（零作答月份由前端补齐）
-  const since12m = new Date(today.getFullYear(), today.getMonth() - 11, 1).toISOString();
-  const byMonth = db.prepare(`
-    SELECT substr(created_at,1,7) AS m, COUNT(*) AS n, SUM(is_correct) AS ok, SUM(duration_ms) AS dur
-    FROM attempt WHERE created_at >= ? GROUP BY m ORDER BY m`).all(since12m);
-
-  // 每年：全部有记录的年份
-  const byYear = db.prepare(`
-    SELECT substr(created_at,1,4) AS y, COUNT(*) AS n, SUM(is_correct) AS ok, SUM(duration_ms) AS dur
-    FROM attempt GROUP BY y ORDER BY y`).all();
-
-  // 打卡天数与连续打卡（从最近一次有作答的日子往前连续推）
-  const activeDays = db.prepare('SELECT DISTINCT substr(created_at,1,10) AS d FROM attempt ORDER BY d DESC').all();
-  let streak = 0;
-  if (activeDays.length) {
-    const set = new Set(activeDays.map(r => r.d));
-    const cursor = new Date(activeDays[0].d);
-    while (set.has(cursor.toISOString().slice(0, 10))) {
-      streak += 1;
-      cursor.setTime(cursor.getTime() - 86400000);
-    }
-  }
-
+  const params = new URL(req.url, 'http://localhost').searchParams;
+  const days = intIn(params.get('days'), 1, 90, 30);
+  // 客户端传本地时区偏移（分钟）：UTC+8 传 480，保证日历格子与用户看到的日期一致
+  const tz = intIn(params.get('tz'), -720, 840, 0);
+  const dayExpr = `strftime('%Y-%m-%d', created_at, '${tz >= 0 ? '+' : ''}${tz} minutes')`;
+  const since = new Date(Date.now() - days * 86400000).toISOString();
+  const total = db.prepare('SELECT COUNT(*) AS n, SUM(is_correct) AS ok FROM attempt WHERE created_at >= ?').get(since);
+  const byDay = db.prepare(`SELECT ${dayExpr} AS d, COUNT(*) AS n, SUM(is_correct) AS ok FROM attempt WHERE created_at >= ? GROUP BY d ORDER BY d`).all(since);
   const domains = db.prepare('SELECT name, overall_mastery FROM domain ORDER BY id DESC').all();
   json(res, 200, {
-    total: all.n || 0,
-    correct: all.ok || 0,
-    accuracy: all.n ? Math.round((all.ok / all.n) * 100) : 0,
-    totalMs: all.dur || 0,
-    daysActive: activeDays.length,
-    streak,
-    byDay, byMonth, byYear, domains,
+    days, tz,
+    total: total.n || 0,
+    correct: total.ok || 0,
+    accuracy: total.n ? Math.round((total.ok / total.n) * 100) : 0,
+    byDay, domains,
   });
 };
 
+// 做题统计：每日/每月/每年聚合 + 连续打卡（热力图/打卡墙通用做法）
+routes['GET /api/stats'] = (req, res) => {
+  if (!authed(req)) return json(res, 401, { error: '未登录' });
+  const params = new URL(req.url, 'http://localhost').searchParams;
+  // 客户端传本地时区偏移（分钟）：UTC+8 传 480，保证日历与用户看到的日期一致
+  const tz = intIn(params.get('tz'), -720, 840, 0);
+  const tzMod = `${tz >= 0 ? '+' : ''}${tz} minutes`;
+  const dayExpr = `strftime('%Y-%m-%d', created_at, '${tzMod}')`;
+  const monthExpr = `strftime('%Y-%m', created_at, '${tzMod}')`;
+  const yearExpr = `strftime('%Y', created_at, '${tzMod}')`;
+
+  const byDay = db.prepare(`SELECT ${dayExpr} AS d, COUNT(*) AS n, SUM(is_correct) AS ok FROM attempt GROUP BY d ORDER BY d`).all();
+  const byMonth = db.prepare(`SELECT ${monthExpr} AS m, COUNT(*) AS n, SUM(is_correct) AS ok FROM attempt GROUP BY m ORDER BY m`).all();
+  const byYear = db.prepare(`SELECT ${yearExpr} AS y, COUNT(*) AS n, SUM(is_correct) AS ok FROM attempt GROUP BY y ORDER BY y`).all();
+  const total = db.prepare('SELECT COUNT(*) AS n, SUM(is_correct) AS ok FROM attempt').get();
+
+  // 连续打卡：今天还没做题时从昨天回推，避免早上刚打开就判定断签
+  const daySet = new Set(byDay.map(r => r.d));
+  const dayKey = (d) => d.toISOString().slice(0, 10);
+  let streak = 0;
+  let cursor = new Date(Date.now() + tz * 60000);
+  if (!daySet.has(dayKey(cursor))) cursor.setDate(cursor.getDate() - 1);
+  while (daySet.has(dayKey(cursor))) {
+    streak++;
+    cursor.setDate(cursor.getDate() - 1);
+  }
+
+  // 最长连续段：遍历有序日期，间隔 1 天则续段
+  let run = 0, bestStreak = 0, prevKey = null;
+  for (const r of byDay) {
+    if (prevKey) {
+      const gap = (new Date(`${r.d}T00:00:00`) - new Date(`${prevKey}T00:00:00`)) / 86400000;
+      run = gap === 1 ? run + 1 : 1;
+    } else {
+      run = 1;
+    }
+    if (run > bestStreak) bestStreak = run;
+    prevKey = r.d;
+  }
+
+  json(res, 200, {
+    ok: true, tz,
+    total: total.n || 0,
+    correct: total.ok || 0,
+    accuracy: total.n ? Math.round((total.ok / total.n) * 100) : 0,
+    active_days: byDay.length,
+    streak,
+    best_streak: bestStreak,
+    first_day: byDay[0]?.d || null,
+    by_day: byDay,
+    by_month: byMonth,
+    by_year: byYear,
+  });
+};
+
+// 划线收藏：只存用户划下的原文片段，来源题目/领域用于回溯；导入题自动带原始网页链接
+routes['GET /api/highlights'] = (req, res) => {
+  if (!authed(req)) return json(res, 401, { error: '未登录' });
+  const params = new URL(req.url, 'http://localhost').searchParams;
+  const q = (params.get('q') || '').trim().slice(0, 120);
+  const dRaw = Number(params.get('domain_id'));
+  const domainId = Number.isInteger(dRaw) && dRaw > 0 ? dRaw : 0;
+  const lRaw = Number(params.get('limit'));
+  const limit = Number.isInteger(lRaw) && lRaw > 0 ? Math.min(500, lRaw) : 200;
+  const oRaw = Number(params.get('offset'));
+  const offset = Number.isInteger(oRaw) && oRaw >= 0 ? Math.min(100000, oRaw) : 0;
+  let sql = 'SELECT h.*, d.name AS domain_name, n.name AS node_name FROM highlight h LEFT JOIN domain d ON d.id = h.domain_id LEFT JOIN node n ON n.id = h.node_id WHERE 1=1';
+  const args = [];
+  if (q) { sql += ' AND (h.text LIKE ? OR h.note LIKE ? OR h.question_stem LIKE ?)'; const like = `%${q}%`; args.push(like, like, like); }
+  if (domainId) { sql += ' AND h.domain_id = ?'; args.push(domainId); }
+  sql += ' ORDER BY h.created_at DESC LIMIT ? OFFSET ?'; args.push(limit, offset);
+  const items = db.prepare(sql).all(...args);
+  const countSql = 'SELECT COUNT(*) AS n FROM highlight h WHERE 1=1' + (q ? ' AND (h.text LIKE ? OR h.note LIKE ? OR h.question_stem LIKE ?)' : '') + (domainId ? ' AND h.domain_id = ?' : '');
+  const total = db.prepare(countSql).get(...(q ? [...Array(3).fill(`%${q}%`)] : []), ...(domainId ? [domainId] : [])).n;
+  json(res, 200, { items, total, count: items.length });
+};
+
+routes['POST /api/highlights'] = async (req, res) => {
+  if (!authed(req)) return json(res, 401, { error: '未登录' });
+  limitOrThrow(req, 'highlight-write', 60, 60 * 1000);
+  const b = await readBody(req);
+  const text = typeof b.text === 'string' ? b.text.trim().slice(0, 2000) : '';
+  if (!text || text.length < 2) return json(res, 400, { error: '划线内容不能为空或过短' });
+  const source = ['stem', 'explanation', 'chat', 'option'].includes(b.source) ? b.source : 'explanation';
+  const questionId = intIn(b.question_id, 1, 2147483647, 0) || null;
+  const nodeId = intIn(b.node_id, 1, 2147483647, 0) || null;
+  const domainId = intIn(b.domain_id, 1, 2147483647, 0) || null;
+  // 从数据库反查题目信息，避免客户端伪造来源
+  let stem = '', sourceUrl = '', realNodeId = nodeId, realDomainId = domainId;
+  if (questionId) {
+    const row = db.prepare(`SELECT q.stem, q.source_url, q.node_id, n.domain_id FROM question q
+      JOIN node n ON n.id = q.node_id WHERE q.id = ?`).get(questionId);
+    if (row) { stem = row.stem || ''; sourceUrl = row.source_url || ''; realNodeId = row.node_id; realDomainId = row.domain_id; }
+  }
+  const note = typeof b.note === 'string' ? b.note.trim().slice(0, 1000) : '';
+  const r = db.prepare(`INSERT INTO highlight (text, source, question_id, node_id, domain_id, question_stem, source_url, note, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(text, source, questionId, realNodeId, realDomainId, stem, sourceUrl, note, now());
+  const item = db.prepare('SELECT h.*, d.name AS domain_name, n.name AS node_name FROM highlight h LEFT JOIN domain d ON d.id=h.domain_id LEFT JOIN node n ON n.id=h.node_id WHERE h.id=?').get(r.lastInsertRowid);
+  json(res, 200, { ok: true, highlight: item });
+};
+
+routes['PATCH /api/highlights/:id'] = async (req, res, m) => {
+  if (!authed(req)) return json(res, 401, { error: '未登录' });
+  const id = intIn(m.id, 1, 2147483647, 0);
+  if (!db.prepare('SELECT 1 FROM highlight WHERE id = ?').get(id)) return json(res, 404, { error: '划线不存在' });
+  const b = await readBody(req);
+  const note = typeof b.note === 'string' ? b.note.trim().slice(0, 1000) : null;
+  if (note !== null) db.prepare('UPDATE highlight SET note = ? WHERE id = ?').run(note, id);
+  const item = db.prepare('SELECT h.*, d.name AS domain_name, n.name AS node_name FROM highlight h LEFT JOIN domain d ON d.id=h.domain_id LEFT JOIN node n ON n.id=h.node_id WHERE h.id=?').get(id);
+  json(res, 200, { ok: true, highlight: item });
+};
+
+routes['DELETE /api/highlights/:id'] = (req, res, m) => {
+  if (!authed(req)) return json(res, 401, { error: '未登录' });
+  const id = intIn(m.id, 1, 2147483647, 0);
+  db.prepare('DELETE FROM highlight WHERE id = ?').run(id);
+  json(res, 200, { ok: true });
+};
+
+routes['GET /api/highlights/export'] = (req, res) => {
+  if (!authed(req)) return json(res, 401, { error: '未登录' });
+  const items = db.prepare(`SELECT h.*, d.name AS domain_name, n.name AS node_name FROM highlight h
+    LEFT JOIN domain d ON d.id=h.domain_id LEFT JOIN node n ON n.id=h.node_id ORDER BY h.created_at DESC`).all();
+  const lines = [`# 划线收藏（${items.length} 条）`, ''];
+  let lastDomain = '';
+  for (const h of items) {
+    if (h.domain_name !== lastDomain) { lines.push(`## ${h.domain_name || '未分类'}`, ''); lastDomain = h.domain_name; }
+    lines.push(`> ${h.text.replace(/\n/g, '\n> ')}`);
+    if (h.note) lines.push('', `备注：${h.note}`);
+    const src = [h.node_name ? `知识点：${h.node_name}` : '', h.source_url ? `原文：${h.source_url}` : ''].filter(Boolean).join(' · ');
+    if (src) lines.push('', `— ${src}`);
+    lines.push('');
+  }
+  res.writeHead(200, { 'Content-Type': 'text/markdown; charset=utf-8', 'Content-Disposition': 'attachment; filename="highlights.md"' });
+  res.end(lines.join('\n'));
+};
+
 // 追问对话（SSE 流式）
+let chatStreams = 0;
 routes['POST /api/chat'] = async (req, res) => {
   if (!authed(req)) return json(res, 401, { error: '未登录' });
+  limitOrThrow(req, 'chat', 20, 60 * 1000);
+  if (chatStreams >= 2) fail(429, '同时进行的对话过多，请稍后再试');
   const b = await readBody(req);
-  const q = normalizeQuestion(db.prepare('SELECT * FROM question WHERE id = ?').get(Number(b.question_id)));
+  const q = normalizeQuestion(db.prepare('SELECT * FROM question WHERE id = ?').get(intIn(b.question_id, 1, 2147483647, 0)));
   if (!q) return json(res, 404, { error: '题目不存在' });
-  const history = Array.isArray(b.history) ? b.history : [];
-  db.prepare('INSERT INTO chat_turn (question_id, role, content, ts) VALUES (?, ?, ?, ?)').run(q.id, 'user', String(b.content || ''), now());
+  const content = text(b.content, 2000);
+  if (!content.trim()) fail(400, '追问内容不能为空');
+  const history = (Array.isArray(b.history) ? b.history : []).slice(-8).map(h => ({
+    role: h && h.role === 'user' ? 'user' : 'assistant',
+    content: text(h && h.content, 1000),
+  })).filter(h => h.content);
+  db.prepare('INSERT INTO chat_turn (question_id, role, content, ts) VALUES (?, ?, ?, ?)').run(q.id, 'user', content, now());
 
-  if (!modelAvailable()) {
-    json(res, 500, { error: '模型未配置：请先在设置页填写模型配置' });
-    return;
-  }
+  if (!modelAvailable()) return json(res, 500, { error: '模型未配置：请先在设置页填写模型配置' });
+  const abort = new AbortController();
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-store',
@@ -583,16 +1172,24 @@ routes['POST /api/chat'] = async (req, res) => {
     'X-Accel-Buffering': 'no',
   });
   res.write(`data: ${JSON.stringify({ role: 'assistant', content: '' })}\n\n`);
+  chatStreams++;
+  let reader = null;
+  let aborted = false;
+  res.on('close', () => {
+    if (aborted) return;
+    aborted = true;
+    abort.abort();
+    try { reader?.cancel?.(); } catch { /* 客户端断开 */ }
+  });
   try {
-    const stream = await llmChat([{ role: 'user', content: promptChat(q, history) }], { stream: true });
+    const stream = await llmChat([{ role: 'user', content: promptChat(q, history, getSetting('nickname') || '小问') }], { stream: true, signal: abort.signal });
     let full = '';
-    const reader = stream.getReader();
+    reader = stream.getReader();
     const decoder = new TextDecoder();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const text = decoder.decode(value, { stream: true });
-      for (const line of text.split('\n')) {
+    let sseBuf = '';
+    // 上游分片不保证按 SSE 帧边界到达，必须缓冲到 \n\n 再解析，否则会随机丢字
+    const emitFrame = (frame) => {
+      for (const line of frame.split('\n')) {
         if (!line.startsWith('data:')) continue;
         const payload = line.slice(5).trim();
         if (payload === '[DONE]') continue;
@@ -604,35 +1201,89 @@ routes['POST /api/chat'] = async (req, res) => {
           }
         } catch { /* 忽略不完整分片 */ }
       }
+    };
+    while (!aborted) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      sseBuf += decoder.decode(value, { stream: true });
+      let sep;
+      while ((sep = sseBuf.indexOf('\n\n')) >= 0) {
+        const frame = sseBuf.slice(0, sep);
+        sseBuf = sseBuf.slice(sep + 2);
+        emitFrame(frame);
+      }
     }
-    db.prepare('INSERT INTO chat_turn (question_id, role, content, ts) VALUES (?, ?, ?, ?)').run(q.id, 'assistant', full, now());
-    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-    res.end();
-  } catch (e) {
-    res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`);
-    res.end();
+    sseBuf += decoder.decode();
+    if (!aborted && sseBuf.trim()) emitFrame(sseBuf);
+    if (!aborted) {
+      db.prepare('INSERT INTO chat_turn (question_id, role, content, ts) VALUES (?, ?, ?, ?)').run(q.id, 'assistant', full, now());
+      res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+      res.end();
+    }
+  } catch {
+    // 上游错误不回显内部信息，客户端断开时也不再写入已关闭的响应
+    if (!aborted && !res.writableEnded) {
+      res.write(`data: ${JSON.stringify({ error: '对话生成失败，请稍后重试' })}\n\n`);
+      res.end();
+    }
+  } finally {
+    chatStreams--;
   }
 };
 
-// 数据导出（备份 SQLite）
-routes['GET /api/export'] = (req, res) => {
+// 数据导出：WAL 模式下直接读主库会得到空文件，必须用一致性快照；
+// 同时剔除 token / 密码哈希 / 模型密钥，备份文件可安全留存。
+routes['GET /api/export'] = async (req, res) => {
   if (!authed(req)) return json(res, 401, { error: '未登录' });
-  res.writeHead(200, {
-    'Content-Type': 'application/octet-stream',
-    'Content-Disposition': `attachment; filename="qingwen-backup-${Date.now()}.db"`,
-  });
-  fs.createReadStream(DB_PATH).pipe(res);
+  limitOrThrow(req, 'export', 5, 60 * 1000);
+  const snapshot = path.join(DATA_DIR, `export-${crypto.randomBytes(8).toString('hex')}.db`);
+  try {
+    db.exec(`VACUUM INTO '${snapshot}'`); // 路径由 hex 生成，无引号注入风险
+    const copy = new DatabaseSync(snapshot);
+    try {
+      copy.exec("DELETE FROM setting WHERE key IN ('token', 'password_hash', 'llm_api_key')");
+      // DELETE 只标记空闲页，密钥明文仍会留在文件里；VACUUM 重建页面才能彻底剔除
+      copy.exec('VACUUM');
+    }
+    finally { copy.close(); }
+    const stat = fs.statSync(snapshot);
+    res.writeHead(200, {
+      'Content-Type': 'application/octet-stream',
+      'Content-Disposition': `attachment; filename="qingwen-backup-${now().slice(0, 10)}.db"`,
+      'Content-Length': stat.size,
+    });
+    const stream = fs.createReadStream(snapshot);
+    res.on('close', () => fs.rmSync(snapshot, { force: true }));
+    await new Promise((resolve, reject) => {
+      stream.on('error', reject);
+      res.on('error', reject);
+      res.on('finish', resolve);
+      stream.pipe(res);
+    });
+  } catch (e) {
+    fs.rmSync(snapshot, { force: true });
+    if (e instanceof HttpError) throw e;
+    if (!res.headersSent) json(res, 500, { error: '导出失败' });
+    else res.destroy();
+  }
 };
 
 // ---------- 请求分发 ----------
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
+async function handleRequest(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const pathname = url.pathname;
 
   // 静态文件 + SPA 回退
   if (!pathname.startsWith('/api/')) {
-    let file = path.join(WEB_DIR, pathname === '/' ? 'index.html' : pathname);
-    if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) file = path.join(WEB_DIR, 'index.html');
+    // 显式限制在前端目录内，避免编码路径或异常 pathname 逃出 WEB_DIR
+    const webRoot = path.resolve(WEB_DIR);
+    let file = path.resolve(webRoot, `.${pathname}`);
+    if (file !== webRoot && !file.startsWith(webRoot + path.sep)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('403');
+      return;
+    }
+    if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) file = path.join(webRoot, 'index.html');
     if (fs.existsSync(file)) {
       const ext = path.extname(file).toLowerCase();
       const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json', '.webmanifest': 'application/manifest+json', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon' };
@@ -642,7 +1293,9 @@ const server = http.createServer(async (req, res) => {
         'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=86400',
         'Content-Length': stat.size,
       });
-      fs.createReadStream(file).pipe(res);
+      const stream = fs.createReadStream(file);
+      stream.on('error', () => { if (!res.headersSent) json(res, 500, { error: '读取文件失败' }); else res.destroy(); });
+      stream.pipe(res);
       return;
     }
     res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -660,11 +1313,27 @@ const server = http.createServer(async (req, res) => {
       const params = {};
       const names = [...pattern.matchAll(/:([^/]+)/g)].map(x => x[1]);
       names.forEach((n, i) => { params[n] = m[i + 1]; });
-      try { await handler(req, res, params); } catch (e) { json(res, 500, { error: e.message || '服务器内部错误' }); }
+      try {
+        await handler(req, res, params);
+      } catch (e) {
+        if (e instanceof HttpError) json(res, e.code, { error: e.message });
+        else {
+          console.error('[qingwen] 请求处理失败', req.method, pathname, e);
+          if (!res.headersSent) json(res, 500, { error: '服务器内部错误' });
+          else res.destroy();
+        }
+      }
       return;
     }
   }
   json(res, 404, { error: '接口不存在' });
+}
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch(e => {
+    console.error('[qingwen] 未捕获请求错误', e);
+    if (!res.headersSent) json(res, 500, { error: '服务器内部错误' });
+    else res.destroy();
+  });
 });
 
 server.listen(PORT, '0.0.0.0', () => {

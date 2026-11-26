@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { api, prefs, toast, setToken } from '../api.js';
+import { api, prefs, toast, getToken } from '../api.js';
 import { navigate } from '../App.jsx';
 
 const FONT_LEVELS = [
@@ -44,6 +44,37 @@ export default function Settings({ onLogout }) {
       }
     } catch (e) { toast(e.message, 'err'); }
     finally { setSaving(false); }
+  };
+
+  const clearModel = async () => {
+    if (!confirm('确定清空模型配置？清空后出题与拆解将无法使用。')) return;
+    try {
+      await api('/api/settings', { method: 'POST', body: JSON.stringify({ clear_llm: true }) });
+      setModel({ base_url: '', api_key: '', chat_model: '', fast_model: '' });
+      const s = await api('/api/settings');
+      setModelStatus(s.model);
+      toast('模型配置已清空', 'ok');
+    } catch (e) { toast(e.message, 'err'); }
+  };
+
+  // 导出接口需要 Bearer Token，普通 <a> 链接带不上鉴权头，改用 fetch 下载
+  const downloadBackup = async () => {
+    try {
+      const resp = await fetch('/api/export', { headers: { Authorization: `Bearer ${getToken()}` } });
+      if (!resp.ok) {
+        let msg = '导出失败';
+        try { const d = await resp.json(); msg = d.error || msg; } catch { /* 非 JSON */ }
+        throw new Error(msg);
+      }
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `qingwen-backup-${new Date().toISOString().slice(0, 10)}.db`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast('备份已开始下载', 'ok');
+    } catch (e) { toast(e.message, 'err'); }
   };
 
   return (
@@ -100,12 +131,12 @@ export default function Settings({ onLogout }) {
         <div className="field">
           <label>Base URL（OpenAI 兼容）</label>
           <input className="input" value={model.base_url} onChange={e => setModel({ ...model, base_url: e.target.value })}
-            placeholder="https://api.deepseek.com/v1" />
+            placeholder={modelStatus?.base_url_set ? '已配置（留空保持不变）' : 'https://api.deepseek.com/v1'} />
         </div>
         <div className="field">
           <label>API Key</label>
           <input className="input" type="password" value={model.api_key} onChange={e => setModel({ ...model, api_key: e.target.value })}
-            placeholder="sk-…" />
+            placeholder={modelStatus?.api_key_set ? '已配置（留空保持不变）' : 'sk-…'} />
         </div>
         <div className="field">
           <label>主力模型（拆清单 / 出题）</label>
@@ -117,21 +148,24 @@ export default function Settings({ onLogout }) {
           <input className="input" value={model.fast_model} onChange={e => setModel({ ...model, fast_model: e.target.value })}
             placeholder="如 deepseek-reasoner 或留空复用主力模型" />
         </div>
-        <button className="btn primary" disabled={saving} onClick={() => save({
-          llm_base_url: model.base_url, llm_api_key: model.api_key,
-          llm_chat_model: model.chat_model, llm_fast_model: model.fast_model,
-        })}>{saving ? <>保存中<span className="dots"></span></> : '保存模型配置（重启生效）'}</button>
-        <p className="muted small mt8">支持 DeepSeek / Kimi / GLM / 通义 / 本地 Ollama 等 OpenAI 兼容接口，换模型只改配置不改代码</p>
+        <div className="row mt12" style={{ gap: 8, flexWrap: 'wrap' }}>
+          <button className="btn primary" disabled={saving} onClick={() => save({
+            llm_base_url: model.base_url, llm_api_key: model.api_key,
+            llm_chat_model: model.chat_model, llm_fast_model: model.fast_model,
+          })}>{saving ? <>保存中<span className="dots"></span></> : '保存模型配置'}</button>
+          <button className="btn danger" disabled={saving} onClick={clearModel}>清空配置</button>
+        </div>
+        <p className="muted small mt8">留空表示保持原值，配置即时生效。支持 DeepSeek / Kimi / GLM / 通义 / 本地 Ollama 等 OpenAI 兼容接口，换模型只改配置不改代码</p>
       </div>
 
       <div className="card enter-d3">
         <h2>💾 数据与账号</h2>
         <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
-          <a className="btn" href="/api/export" style={{ textDecoration: 'none' }} onClick={() => toast('已开始下载备份', 'ok')}>导出数据备份</a>
+          <button className="btn" onClick={downloadBackup}>导出数据备份</button>
           <button className="btn" onClick={() => navigate('/')}>返回首页</button>
           <button className="btn danger" onClick={() => { if (confirm('退出登录？需要重新输入密码进入。')) { onLogout(); } }}>退出登录</button>
         </div>
-        <p className="muted small mt8">数据以 SQLite 单文件保存在服务器，导出即全量备份</p>
+        <p className="muted small mt8">导出为一致性快照，已剔除登录令牌与模型密钥；恢复后重新设置密码即可</p>
       </div>
     </>
   );

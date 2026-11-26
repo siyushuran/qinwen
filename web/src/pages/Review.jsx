@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { api, fmtTime, toast } from '../api.js';
+import { api, toast } from '../api.js';
 import { navigate } from '../App.jsx';
 
 export default function Review() {
@@ -33,7 +33,7 @@ export default function Review() {
             <ul style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
               {due.map((n, i) => (
                 <li key={n.id} className="map-node wave-item" style={{ animationDelay: `${i * 0.06}s`, cursor: 'pointer' }}
-                  onClick={() => navigate(`/learn/${n.domain_id}`)}>
+                  onClick={() => navigate(`/learn/${n.domain_id}?node=${n.id}`)}>
                   <span style={{ width: 12, height: 12, borderRadius: '50%', background: 'var(--accent)', flexShrink: 0 }} />
                   <div className="grow">
                     <strong>{n.name}</strong>

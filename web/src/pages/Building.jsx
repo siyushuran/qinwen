@@ -15,6 +15,7 @@ export default function Building({ domainId }) {
   const [nodes, setNodes] = useState([]);
   const [stepIdx, setStepIdx] = useState(0);
   const [newPoint, setNewPoint] = useState({});
+  const [retry, setRetry] = useState(0);
 
   useEffect(() => {
     let alive = true;
@@ -34,7 +35,7 @@ export default function Building({ domainId }) {
           try {
             const res = await api(`/api/domains/${domainId}/build`, {
               method: 'POST',
-              body: JSON.stringify({ domain_name: data.domain.name, level: '' }),
+              body: JSON.stringify({ domain_name: data.domain.name, level: data.domain.level || '' }),
             });
             if (!alive) return;
             setNodes(res.nodes);
@@ -51,7 +52,10 @@ export default function Building({ domainId }) {
       }
     })();
     return () => { alive = false; };
-  }, [domainId]);
+  }, [domainId, retry]);
+
+  // 同路由重试必须真的重新执行构建，单纯 navigate 到当前 hash 不会触发刷新
+  const retryBuild = () => { setPhase('building'); setStepIdx(0); setRetry(n => n + 1); };
 
   const facets = nodes.filter(n => !n.parent_id);
   const addPoint = async (facetId) => {
@@ -67,9 +71,12 @@ export default function Building({ domainId }) {
   };
   const removeNode = async (id) => {
     if (!confirm('删除该节点？相关练习记录也会清除。')) return;
-    await api(`/api/nodes/${id}`, { method: 'DELETE' });
-    const data = await api(`/api/domains/${domainId}`);
-    setNodes(data.nodes);
+    try {
+      await api(`/api/nodes/${id}`, { method: 'DELETE' });
+      const data = await api(`/api/domains/${domainId}`);
+      setNodes(data.nodes);
+      toast('已删除', 'ok');
+    } catch (e) { toast(e.message, 'err'); }
   };
 
   if (phase === 'loading' || phase === 'building') {
@@ -109,7 +116,7 @@ export default function Building({ domainId }) {
           <p className="muted small">请到「设置」页检查模型配置（Base URL / API Key / 模型名）后重试</p>
           <div className="row">
             <button className="btn" onClick={() => navigate('/settings')}>去设置</button>
-            <button className="btn primary" onClick={() => navigate(`/building/${domainId}`)}>重试</button>
+            <button className="btn primary" onClick={retryBuild}>重试</button>
           </div>
         </div>
       </div>

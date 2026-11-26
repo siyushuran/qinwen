@@ -19,7 +19,7 @@ export default function DomainNew() {
     if (!trimmed) return toast('先告诉它想学什么', 'err');
     setLoading(true);
     try {
-      const data = await api('/api/domains', { method: 'POST', body: JSON.stringify({ name: trimmed }) });
+      const data = await api('/api/domains', { method: 'POST', body: JSON.stringify({ name: trimmed, level }) });
       toast('领域已创建，开始拆解清单', 'ok');
       navigate(`/building/${data.id}`);
     } catch (err) {

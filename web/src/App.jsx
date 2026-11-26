@@ -9,6 +9,8 @@ import MapPage from './pages/Map.jsx';
 import Review from './pages/Review.jsx';
 import Mistakes from './pages/Mistakes.jsx';
 import Report from './pages/Report.jsx';
+import Stats from './pages/Stats.jsx';
+import Highlights from './pages/Highlights.jsx';
 import Settings from './pages/Settings.jsx';
 
 // 极简 hash 路由（自用轻量，避免引入路由库）
@@ -27,12 +29,17 @@ const TABS = [
   { path: '/', label: '领域', ico: '📘' },
   { path: '/review', label: '复习', ico: '🔁' },
   { path: '/mistakes', label: '错题', ico: '📝' },
+  { path: '/highlights', label: '划线', ico: '✍️' },
   { path: '/report', label: '报告', ico: '📈' },
+  { path: '/stats', label: '统计', ico: '📊' },
   { path: '/settings', label: '设置', ico: '⚙️' },
 ];
 
 export default function App() {
   const route = useHashRoute();
+  // hash 里可带查询参数，例如 /learn/3?node=12&q=45（地图/错题本直达）
+  const [pathname, search = ''] = route.split('?');
+  const query = new URLSearchParams(search);
   const [authed, setAuthed] = useState(Boolean(getToken()));
 
   useEffect(() => {
@@ -43,20 +50,28 @@ export default function App() {
   }, [route]);
 
   const onAuthed = useCallback(() => { setToken(localStorage.getItem('qw_token')); setAuthed(true); }, []);
-  const onLogout = useCallback(() => { setToken(''); setAuthed(false); navigate('/'); }, []);
+  const onLogout = useCallback(async () => {
+    // 退出时让服务端令牌同步失效；即使请求失败也清掉本地状态
+    try { await api('/api/auth/logout', { method: 'POST' }); } catch { /* 本地继续退出 */ }
+    setToken(''); setAuthed(false); navigate('/');
+  }, []);
 
   if (!authed) return <Login onAuthed={onAuthed} />;
 
   let page = null;
-  if (route === '/' || route === '') page = <Home />;
-  else if (route.startsWith('/domains/new')) page = <DomainNew />;
-  else if (route.startsWith('/building/')) page = <Building domainId={route.split('/')[2]} />;
-  else if (route.startsWith('/learn/')) page = <Learn domainId={route.split('/')[2]} />;
-  else if (route.startsWith('/map/')) page = <MapPage domainId={route.split('/')[2]} />;
-  else if (route === '/review') page = <Review />;
-  else if (route === '/mistakes') page = <Mistakes />;
-  else if (route === '/report') page = <Report />;
-  else if (route === '/settings') page = <Settings onLogout={onLogout} />;
+  if (pathname === '/' || pathname === '') page = <Home />;
+  else if (pathname.startsWith('/domains/new')) page = <DomainNew />;
+  else if (pathname.startsWith('/building/')) page = <Building domainId={pathname.split('/')[2]} />;
+  else if (pathname.startsWith('/learn/')) page = (
+    <Learn domainId={pathname.split('/')[2]} focusNode={query.get('node')} focusQuestion={query.get('q')} />
+  );
+  else if (pathname.startsWith('/map/')) page = <MapPage domainId={pathname.split('/')[2]} />;
+  else if (pathname === '/review') page = <Review />;
+  else if (pathname === '/mistakes') page = <Mistakes />;
+  else if (pathname === '/highlights') page = <Highlights />;
+  else if (pathname === '/report') page = <Report />;
+  else if (pathname === '/stats') page = <Stats />;
+  else if (pathname === '/settings') page = <Settings onLogout={onLogout} />;
   else page = <Home />;
 
   return (
@@ -68,7 +83,7 @@ export default function App() {
             <span>轻问练</span>
           </div>
           <div className="actions">
-            {route !== '/settings' && <button className="btn ghost sm" onClick={() => navigate('/settings')}>设置</button>}
+            {pathname !== '/settings' && <button className="btn ghost sm" onClick={() => navigate('/settings')}>设置</button>}
           </div>
         </header>
         <main>{page}</main>
@@ -78,7 +93,7 @@ export default function App() {
           {TABS.map(t => (
             <button
               key={t.path}
-              className={`tab ${(route === t.path || (t.path === '/' && route.startsWith('/learn')) || (t.path === '/' && (route.startsWith('/domains') || route.startsWith('/building') || route.startsWith('/map')))) ? 'active' : ''}`}
+              className={`tab ${(pathname === t.path || (t.path === '/' && pathname.startsWith('/learn')) || (t.path === '/' && (pathname.startsWith('/domains') || pathname.startsWith('/building') || pathname.startsWith('/map')))) ? 'active' : ''}`}
               onClick={() => navigate(t.path)}
             >
               <span className="ico">{t.ico}</span>

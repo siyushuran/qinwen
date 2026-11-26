@@ -256,6 +256,8 @@ ul { list-style: none; }
 }
 .option:hover:not(:disabled) { border-color: var(--primary); background: #f0f3ff; }
 .option:active:not(:disabled) { transform: scale(.975); }
+.option.selected { border-color: var(--primary); background: rgba(99,102,241,.1); }
+.option.selected .key { background: var(--primary); color: #fff; }
 .option .key {
   width: 28px; height: 28px; border-radius: 8px; flex-shrink: 0;
   display: grid; place-items: center; font-weight: 700;
@@ -318,3 +320,40 @@ ul { list-style: none; }
 .mt8 { margin-top: 8px; } .mt12 { margin-top: 12px; }
 .center { text-align: center; }
 .hidden { display: none !important; }
+
+/* ---------- 划线收藏 ---------- */
+.highlightable { user-select: text; -webkit-user-select: text; }
+.hl-mark {
+  background: linear-gradient(180deg, transparent 55%, rgba(250, 204, 21, .55) 55%);
+  color: inherit; border-radius: 3px; padding: 0 1px;
+  cursor: pointer;
+}
+.hl-pop {
+  position: fixed; z-index: 9999; display: flex; align-items: center; gap: 8px;
+  background: #1e293b; color: #fff; padding: 6px 10px; border-radius: 12px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, .25); font-size: .84em;
+  animation: waveIn .16s var(--ease-out-back) both;
+}
+.hl-btn {
+  background: var(--grad); color: #fff; border: none; border-radius: 8px;
+  padding: 5px 10px; font-size: .9em; cursor: pointer; font-weight: 600;
+}
+.hl-btn:disabled { opacity: .6; cursor: default; }
+.hl-count { opacity: .75; white-space: nowrap; }
+.hl-item {
+  border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 12px 14px; background: var(--surface-2);
+}
+.hl-text {
+  white-space: pre-wrap; word-break: break-word; line-height: 1.6;
+  border-left: 3px solid #facc15; padding-left: 10px;
+}
+.hl-note {
+  font-size: .86em; color: var(--ink-soft); background: var(--surface);
+  border-radius: var(--radius-sm); padding: 8px 10px;
+}
+.linklike {
+  background: none; border: none; padding: 0; cursor: pointer;
+  color: var(--primary, #6366f1); font-size: inherit; text-decoration: underline;
+}
+.h1, .h-lg { font-size: 1.35em; font-weight: 800; }

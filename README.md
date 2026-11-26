@@ -16,16 +16,20 @@
 
 - 单用户访问密码（scrypt 哈希存储，Bearer Token 鉴权）
 - 创建领域 → AI 拆知识清单（构建过程拟人化可视化，清单可增删）
-- 出题（单选/判断，落库缓存复用）→ 作答判定 + AI 讲解
-- 错因标签（概念不清/计算失误/审题偏差/纯手滑），错题自动入本
+- 出题（单选/判断，落库缓存复用，下发数据不含答案）→ 提交作答后才判分并高亮对错 + AI 讲解
+- 错因标签（概念不清/计算失误/审题偏差/纯手滑），作答后补记并保存，错题本可按错因筛选
+- 地图/复习/错题本可直达对应知识点或指定题目（错题「重练这题」）
+- 创建领域时选择的起始基础真正参与 AI 拆解清单
 - 掌握度记录 + 简化间隔复习调度（答对延长间隔、答错次日重练）
 - 追问面板（SSE 流式，苏格拉底式引导，不直接报答案）
+- 做题进度按领域保存（知识点/题目/难度），重新进入练习页接着练，不从头开始
+- 答对后主推「出下一题」：按知识点顺序推进，跳过本轮已见过的题（仅有一个知识点时现场出新题）
 - 快捷操作：出个类似的 / 同层换新 / 换个方向
 - 知识地图（掌握度着色）、复习队列、错题本、学习报告（真实数据日历）
 - 全局字号 5 档、动效两档（首帧防闪烁）、助手昵称与兴趣场景配置
-- 模型配置（Base URL / API Key / 主力模型 / 快速模型，设置页可改）
+- 模型配置（Base URL / API Key / 主力模型 / 快速模型，设置页可改；输入框留空表示保持原值，清空需显式操作）
 - PWA manifest（加到主屏，不做离线缓存）
-- 数据导出（SQLite 单文件全量备份）
+- 数据导出（一致性 SQLite 快照，自动剔除令牌/密码哈希/模型密钥）
 - 降级原则：模型未配置/不可达时明确报错，不放假数据
 
 ## 目录结构
@@ -59,16 +63,21 @@ cd server && PORT=3000 node server.mjs
 # 前端
 cd web && npm install && npm run dev   # 开发
 cd web && npm run build                # 构建到 dist/
+
+# 端到端冒烟测试（模拟模型 + 真实后端，覆盖主要流程与关键边界）
+node server/smoke-test.mjs
+
+# 部署后静态资源/健康检查验证
+node verify.js <目标地址> <web/dist路径> <结果输出路径>
 ```
 
 ## 访问方式
 
-1. **局域网**：`http://<NAS内网IP>:18321`
-2. **公网**：NAS 公网入口仅暴露 1487（fnOS 管理页），容器端口 18321 未直接对公网开放。
-   与现有 navidrome / siyuan 等服务一致，需要经反向代理访问：
-   - 在 fnOS「Docker」应用或 Lucky 等反向代理工具中新增规则，
-     目标指向 `http://<NAS内网IP>:18321`（或容器地址 `http://qingwen-practice:3000`），
-   - 或在路由器上为 18321 增加端口转发（注意安全，配合访问密码使用）。
+1. **日常访问（反代）**：`https://qw.icge.top:1487`
+   - 已配置反向代理，将请求转发到容器 `http://qingwen-practice:3000`（宿主 `http://<NAS内网IP>:18321`）。
+   - 容器端口 18321 不直接对公网开放，公网请始终使用上述 HTTPS 地址。
+2. **局域网直连（备用）**：`http://<NAS内网IP>:18321`
+   - 若反代不可用，可在 NAS 本地网络上直连；公网直连该端口通常会被网关拒绝。
 3. **首次进入**：设置访问密码 → 创建领域 → AI 拆解清单 → 开始练习。
 4. **使用前必做**：进入「设置」页填写模型配置（Base URL / API Key / 模型名），
    支持 DeepSeek / Kimi / GLM / 通义 / 本地 Ollama 等 OpenAI 兼容接口。
@@ -82,3 +91,66 @@ cd web && npm run build                # 构建到 dist/
 | 模型配置 | 应用内「设置」页，存 SQLite setting 表 | 重启生效 |
 | 访问密码 | 应用内首次进入设置 | scrypt 哈希存储 |
 | 字号/动效 | 应用内「设置」页，localStorage | 即时生效 |
+
+## 安全说明
+
+- 鉴权：密码异步 scrypt 哈希；Bearer Token 常量时间比较；登录/初始化接口按 IP 限流；退出登录会同步撤销服务端令牌。
+- 模型地址：只允许公网 HTTPS；本地 Ollama 等回环 HTTP 例外；拒绝内网/链路本地/云元数据地址，禁止跟随跳转，避免 API Key 被带往任意地址。日志与错误响应不回显上游响应体。
+- 数据导出：使用 `VACUUM INTO` 生成一致性快照（WAL 下直接拷贝主库可能是空文件），删除令牌、密码哈希、模型密钥后再 `VACUUM` 重建页面，避免明文残留在空闲页；恢复后需重新设置密码与模型配置。
+- 写入可靠性：作答、出题、清单重建、删除均使用 SQLite 事务；同一知识点的出题串行化，避免并发产生重复题或丢失掌握度更新。
+- 限流：登录 8 次/10 分钟、初始化 5 次/10 分钟、出题 40 次/分钟（「出下一题」12 次/分钟）、作答 60 次/分钟、拆解 5 次/分钟、追问 20 次/分钟（最多 2 路并发）、导出 5 次/分钟；模型调用全局最多 2 并发，单知识点题目上限 200 道。
+
+## 外部题库：芒格思维模型（munger-kb）
+
+网站已内置题库导入能力，并把 `https://mungermodels.com/` 的 1290 道客观题导入为领域「芒格思维模型」。题目从知识库真实结构化字段确定性生成（题型 5 类），不调用模型、不编造事实，每题保留 `source_url` 可追溯。
+
+- 结构：1 个 domain（source_key=`munger-kb://domain/munger-models`）→ 14 个学科 facet → 231 个模型知识点 → 1290 道题。
+- 题型：attribution 模型→学科 231、english 英文名 138、relation 关联模型 462、summary 摘要→模型 228、judge 判断 231。
+- 难度按题型分层（1/2/3），确保每个模型节点都有难度 1 的入口题，网站默认出题即可命中导入题。
+- 导入幂等：以 `source_key` 判定已存在对象，只补缺，不删除用户作答/进度；重复导入会跳过已存在的题。
+- 出题逻辑不变：`POST /api/questions` 仍优先取缓存题，导入题与 AI 生成题共用同一出题/作答/错题/复习流程，前端无需改动。
+
+管理接口（均需 Bearer Token）：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/bank/stats` | 查看题库统计（领域/知识点/题目数、题型分布） |
+| POST | `/api/bank/import` | 导入题目 JSON，body `{questions:[...]}`，幂等 |
+
+题目 JSON 字段：`bank_id`（唯一键）、`domain_name`、`node_name`、`type`、`difficulty`、`stem`、`options`（数组）、`answer`（必须是某个选项原文）、`explanation`、`source_url`、`source_type`、`model`、`prompt_ver`。
+
+本地操作：
+
+```bash
+# 1) 在 munger-kb 目录重新生成题库（网站内容更新后）
+cd ../munger-kb && python question_bank.py
+
+# 2) 导入到网站（需要网站登录 token）
+cd ../qingwen-practice/server
+node import-questions.mjs ../munger-kb/data/export/question_bank.jsonl \
+  --url https://qw.icge.top:1487 --token '<网站token>' --batch 200
+
+# 3) 端到端验证（临时库，不影响线上）
+node bank-import-test.mjs
+```
+
+## 划线收藏
+
+在题目卡里选中**题干、作答后的讲解、AI 追问回复**中的任意文字，浮出的「✍️ 划线收藏」按钮会把原句存入划线本；已划线的句子在原处高亮显示。用于收集芒格模型里值得回看的句子。
+
+- 入口：底部导航「划线」，或 `#/highlights`
+- 每条划线可加备注、按领域/关键词筛选、跳转到来源知识点或原始网页、删除
+- 「导出」按钮下载 Markdown（`highlights.md`），方便归档到笔记软件
+- 划线来源（题干/讲解/追问）与来源题目、原始网页链接由服务端从题目反查写入，客户端无法伪造
+
+API（均需 Bearer Token）：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/highlights?q=&domain_id=&limit=&offset=` | 列表，可按内容/备注/题干搜索、按领域过滤 |
+| POST | `/api/highlights` | 新增，body `{text, source, question_id, note}` |
+| PATCH | `/api/highlights/:id` | 改备注 |
+| DELETE | `/api/highlights/:id` | 删除 |
+| GET | `/api/highlights/export` | 导出 Markdown |
+
+验证：`node server/highlight-test.mjs`（临时库，覆盖增删改查/搜索/导出/来源反查）。
