@@ -11,6 +11,8 @@ import Mistakes from './pages/Mistakes.jsx';
 import Report from './pages/Report.jsx';
 import Stats from './pages/Stats.jsx';
 import Highlights from './pages/Highlights.jsx';
+import Materials from './pages/Materials.jsx';
+import MaterialDetail from './pages/MaterialDetail.jsx';
 import Settings from './pages/Settings.jsx';
 
 // 极简 hash 路由（自用轻量，避免引入路由库）
@@ -27,6 +29,7 @@ export function navigate(to) { location.hash = to; }
 
 const TABS = [
   { path: '/', label: '领域', ico: '📘' },
+  { path: '/materials', label: '资料', ico: '📄' },
   { path: '/review', label: '复习', ico: '🔁' },
   { path: '/mistakes', label: '错题', ico: '📝' },
   { path: '/highlights', label: '划线', ico: '✍️' },
@@ -60,6 +63,8 @@ export default function App() {
 
   let page = null;
   if (pathname === '/' || pathname === '') page = <Home />;
+  else if (pathname === '/materials') page = <Materials />;
+  else if (pathname.startsWith('/material/')) page = <MaterialDetail materialId={pathname.split('/')[2]} />;
   else if (pathname.startsWith('/domains/new')) page = <DomainNew />;
   else if (pathname.startsWith('/building/')) page = <Building domainId={pathname.split('/')[2]} />;
   else if (pathname.startsWith('/learn/')) page = (
@@ -93,7 +98,7 @@ export default function App() {
           {TABS.map(t => (
             <button
               key={t.path}
-              className={`tab ${(pathname === t.path || (t.path === '/' && pathname.startsWith('/learn')) || (t.path === '/' && (pathname.startsWith('/domains') || pathname.startsWith('/building') || pathname.startsWith('/map')))) ? 'active' : ''}`}
+              className={`tab ${(pathname === t.path || (t.path === '/' && pathname.startsWith('/learn')) || (t.path === '/' && (pathname.startsWith('/domains') || pathname.startsWith('/building') || pathname.startsWith('/map'))) || (t.path === '/materials' && pathname.startsWith('/material/'))) ? 'active' : ''}`}
               onClick={() => navigate(t.path)}
             >
               <span className="ico">{t.ico}</span>

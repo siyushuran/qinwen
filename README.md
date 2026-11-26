@@ -15,6 +15,7 @@
 ## 已实现功能（对齐方案 M0–M3 核心）
 
 - 单用户访问密码（scrypt 哈希存储，Bearer Token 鉴权）
+- 资料库（M4）：粘贴文章/Markdown → 按标题切块 → 生成摘要、按资料拆清单、接地问答、资料出题
 - 创建领域 → AI 拆知识清单（构建过程拟人化可视化，清单可增删）
 - 出题（单选/判断，落库缓存复用，下发数据不含答案）→ 提交作答后才判分并高亮对错 + AI 讲解
 - 错因标签（概念不清/计算失误/审题偏差/纯手滑），作答后补记并保存，错题本可按错因筛选
@@ -133,6 +134,39 @@ node import-questions.mjs ../munger-kb/data/export/question_bank.jsonl \
 # 3) 端到端验证（临时库，不影响线上）
 node bank-import-test.mjs
 ```
+
+## 资料库（文章 / Markdown 接入）
+
+「资料」页可粘贴公众号文章正文或 Markdown。服务端按标题层级切块（单块约 1200 字），存 `material` / `material_chunk` 两张表；后续摘要、清单、出题、问答都带出处编号，争议内容默认按「文章称」口径处理（可在导入时选择）。
+
+- 摘要：ASD-STE100 简化风格，输出一句话 + 要点 + 时间线，用快速模型生成并缓存。
+- 按资料拆清单：只依据资料正文生成「知识面 → 知识点」，可一键创建领域。
+- 资料出题：围绕知识点生成单选/判断题，解析强制引用资料编号，落库后走既有练习/错题/复习闭环。
+- 资料问答：SSE 流式，先按中文双字 + 英文词做关键词召回（无需 embedding / 向量库），再要求模型仅依据片段作答并标注引用；资料没写就明确说不知道。
+- 划线：原文片段与回答都可划线，导出 Markdown 时带原文链接。
+
+API（均需 Bearer Token）：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/materials` | 资料列表（含切块数与关联领域） |
+| POST | `/api/materials` | 入库并切块，body `{title, content, source_url, domain_id, claim_policy}` |
+| GET | `/api/materials/:id` | 资料详情与全部分块 |
+| DELETE | `/api/materials/:id` | 删除资料与分块（保留已生成题目） |
+| POST | `/api/materials/:id/summary` | 生成/读取摘要（缓存） |
+| POST | `/api/materials/:id/build` | 按资料拆清单并创建或复用领域 |
+| POST | `/api/materials/:id/questions` | 按资料生成题目，body `{node_id?, count, difficulty}` |
+| POST | `/api/materials/:id/chat` | 资料问答（SSE，首帧为引用来源） |
+
+题库导入已通用化：`POST /api/bank/import` 可选传 `domain_name`、`domain_key`、`source_key_prefix`、`domain_source`，缺省仍为 `munger-kb`，不影响既有芒格题库。`GET /api/bank/stats?prefix=...&domain_key=...` 可按前缀查看统计。
+
+一次性导入文章（需要网站登录 token）：
+
+```bash
+QW_TOKEN='<网站token>' node server/seed-article.mjs https://qw.icge.top:1487 ../outputs/qinwen-article-learning-material.md
+```
+
+验证：`node server/material-test.mjs`（临时库 + 模拟模型，覆盖入库/摘要/清单/出题/问答/划线/通用导入）。
 
 ## 划线收藏
 

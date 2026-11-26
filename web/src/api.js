@@ -57,6 +57,43 @@ export async function streamChat(payload, onDelta, onDone, onError) {
   }
 }
 
+// 资料问答流：首帧是引用来源，后续帧是回答正文
+export async function streamMaterialChat(materialId, payload, onSources, onDelta, onDone, onError) {
+  try {
+    const resp = await fetch(`/api/materials/${materialId}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${getToken()}` },
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok || !resp.body) throw new Error('无法开启资料问答');
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const chunk = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        for (const line of chunk.split('\n')) {
+          if (!line.startsWith('data:')) continue;
+          try {
+            const ev = JSON.parse(line.slice(5).trim());
+            if (ev.error) throw new Error(ev.error);
+            if (ev.sources) onSources(ev.sources);
+            if (ev.content) onDelta(ev.content);
+            if (ev.done) { onDone(); return; }
+          } catch (e) {
+            if (e.message && !e.message.startsWith('无法')) throw e;
+          }
+        }
+      }
+    }
+    onDone();
+  } catch (e) { onError(e); }
+}
+
 // 偏好（localStorage，首帧由 index.html 内联脚本写入防闪烁）
 export const prefs = {
   get fontScale() { return localStorage.getItem('qw_font_scale') || '3'; },

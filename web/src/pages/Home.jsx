@@ -32,8 +32,12 @@ export default function Home() {
             <h2 style={{ color: '#fff' }}>今日练什么</h2>
             <p className="small" style={{ color: 'rgba(255,255,255,.85)' }}>点开一个领域，或新建一个想学的领域</p>
           </div>
-          <button className="btn" style={{ background: 'rgba(255,255,255,.2)', color: '#fff', border: 'none', backdropFilter: 'blur(4px)' }}
-            onClick={() => navigate('/domains/new')}>＋ 新领域</button>
+          <div className="row" style={{ gap: 8 }}>
+            <button className="btn sm" style={{ background: 'rgba(255,255,255,.2)', color: '#fff', border: 'none' }}
+              onClick={() => navigate('/materials')}>📄 导入资料</button>
+            <button className="btn" style={{ background: 'rgba(255,255,255,.2)', color: '#fff', border: 'none', backdropFilter: 'blur(4px)' }}
+              onClick={() => navigate('/domains/new')}>＋ 新领域</button>
+          </div>
         </div>
       </div>
 
