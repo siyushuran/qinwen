@@ -4,6 +4,7 @@ import { navigate } from '../App.jsx';
 import Highlightable from '../components/Highlightable.jsx';
 
 const ERROR_TAGS = ['概念不清', '计算失误', '审题偏差', '纯手滑'];
+const DIFF_LABEL = { 1: '入门', 2: '基础', 3: '进阶', 4: '挑战', 5: '硬核' };
 
 export default function Learn({ domainId, focusNode, focusQuestion }) {
   const [domain, setDomain] = useState(null);
@@ -178,6 +179,12 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
     );
   };
 
+  const chooseDifficulty = (d) => {
+    if (d === difficulty) return;
+    setDifficulty(d);
+    // 正在做题时立即按新难度换题；idle 状态只记下选择，下次出题生效
+    if (question && phase !== 'asking') ask(question.node_id, d, { fresh: true });
+  };
   const nextQuestion = () => {
     if (!question || nodes.length === 0) return;
     const idx = nodes.findIndex(n => n.id === question.node_id);
@@ -210,9 +217,18 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
           <div className="row" style={{ gap: 8 }}>
             <button className="btn ghost sm" onClick={() => navigate('/')}>← 领域</button>
             <strong>{domain.name}</strong>
-            <span className="muted small">难度 {difficulty}/5</span>
           </div>
           <button className="btn ghost sm" onClick={() => navigate(`/map/${domainId}`)}>知识地图</button>
+        </div>
+        <div className="row mt8" style={{ gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+          <span className="muted small" style={{ flexShrink: 0 }}>难度</span>
+          {[1, 2, 3, 4, 5].map(d => (
+            <button key={d} className={`chip ${difficulty === d ? 'on' : ''}`}
+              style={{ padding: '4px 12px', fontSize: '.82em' }}
+              title={`${d} 档 · ${DIFF_LABEL[d]}`}
+              onClick={() => chooseDifficulty(d)}>{d}</button>
+          ))}
+          <span className="muted small">{DIFF_LABEL[difficulty]}</span>
         </div>
       </div>
 
