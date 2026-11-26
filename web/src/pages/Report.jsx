@@ -51,7 +51,10 @@ export default function Report() {
                 background: d.n === 0 ? 'var(--surface-2)' : d.ok / d.n >= 0.5 ? 'var(--primary)' : 'var(--err)',
                 opacity: d.n === 0 ? .5 : .95,
                 animation: `waveIn .3s var(--ease-out-back) ${i * 0.02}s both`,
-              }} />
+                display: 'grid', placeItems: 'center',
+              }}>
+                {d.n > 0 && <span style={{ color: '#fff', fontSize: '.8em', fontWeight: 700 }}>{d.n}</span>}
+              </div>
               <div className="muted small" style={{ fontSize: '.65em' }}>{d.d.getDate()}</div>
             </div>
           ))}

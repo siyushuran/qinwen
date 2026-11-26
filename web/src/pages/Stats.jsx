@@ -24,6 +24,7 @@ const fmtKey = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDa
 
 export default function Stats() {
   const [data, setData] = useState(null);
+  const [detailLimit, setDetailLimit] = useState(14);
 
   useEffect(() => {
     // getTimezoneOffset 与本地偏移符号相反，取负后传给后端按本地日聚合
@@ -109,6 +110,51 @@ export default function Stats() {
           ))}
           <span className="muted">多</span>
         </div>
+      </div>
+
+      <div className="card enter-d2">
+        <h2>📋 每日明细</h2>
+        <p className="sub mb12">按本地日期倒序列出每一天的做题量、答对数与正确率</p>
+        {days.length === 0 ? (
+          <p className="muted">还没有做题记录</p>
+        ) : (
+          <>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {[...days].reverse().slice(0, detailLimit).map((d, i) => {
+                const [, m, dd] = d.d.split('-');
+                const week = ['日', '一', '二', '三', '四', '五', '六'][new Date(Number(d.d.slice(0, 4)), Number(m) - 1, Number(dd)).getDay()];
+                const rate = d.n ? Math.round((d.ok / d.n) * 100) : 0;
+                return (
+                  <div key={d.d} className="wave-item" style={{
+                    animationDelay: `${Math.min(i, 12) * 0.03}s`,
+                    display: 'flex', alignItems: 'center', gap: 12,
+                    padding: '10px 12px', borderRadius: 'var(--radius-sm)', background: 'var(--surface-2)',
+                  }}>
+                    <div style={{ width: 62, flexShrink: 0 }}>
+                      <strong style={{ fontSize: '.95em' }}>{Number(m)}/{Number(dd)}</strong>
+                      <div className="muted small" style={{ fontSize: '.7em' }}>周{week}</div>
+                    </div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontWeight: 700, fontSize: '1.05em' }}>{d.n} <span className="muted small" style={{ fontWeight: 400 }}>题</span></div>
+                      <div style={{ height: 5, borderRadius: 999, background: 'var(--line)', marginTop: 5, overflow: 'hidden' }}>
+                        <div style={{ height: '100%', width: `${rate}%`, background: rate >= 60 ? 'var(--grad)' : 'var(--err)', borderRadius: 999 }} />
+                      </div>
+                    </div>
+                    <div style={{ textAlign: 'right', flexShrink: 0 }}>
+                      <div className="small" style={{ color: rate >= 60 ? 'var(--ok)' : 'var(--err)', fontWeight: 600 }}>{rate}%</div>
+                      <div className="muted small" style={{ fontSize: '.7em' }}>对 {d.ok}</div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            {days.length > detailLimit && (
+              <button className="btn sm block mt12" onClick={() => setDetailLimit(v => v + 30)}>
+                显示更多（还有 {days.length - detailLimit} 天）
+              </button>
+            )}
+          </>
+        )}
       </div>
 
       <div className="card enter-d2">
