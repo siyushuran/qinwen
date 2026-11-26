@@ -2,7 +2,7 @@
 
 ## 命令
 - 后端：`cd server && PORT=3000 node server.mjs`（依赖 Node 24 内置 `node:sqlite`；本机 Node 22，线上 node:24-alpine，以线上为准）
-- 前端：`cd web && npm install && npm run dev`；`npm run build` 产出 `web/dist/`，构建产物随仓库提交并由后端同进程托管
+- 前端：`cd web && npm install && npm run dev`；`npm run build` 产出 `web/dist/`（被 .gitignore 忽略，不进 Git），由后端同进程托管；部署需手动上传新 assets 并删除旧哈希文件
 - 测试（临时库 + 模拟模型，不影响线上）：`node server/smoke-test.mjs`、`node server/bank-import-test.mjs`、`node server/material-test.mjs`、`node server/highlight-test.mjs`
 - 部署校验：`node verify.js <URL> <web/dist路径> <结果路径>`，从 dist/index.html 动态发现资源
 - 一次性文章导入：`QW_TOKEN=<token> node server/seed-article.mjs <站点URL> <资料.md> [领域名]`；令牌也可由 `QW_DB=<只读库副本>` 从 setting 表读取

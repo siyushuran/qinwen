@@ -46,7 +46,7 @@ qingwen-practice/
 ├── web/                        # 前端源码（Vite + React）
 │   ├── src/pages/              # 含 Materials.jsx / MaterialDetail.jsx / Palace.jsx
 │   ├── public/                 # manifest / icon
-│   └── dist/                   # 构建产物（部署用，随仓库提交）
+│   └── dist/                   # 构建产物（部署用，本地生成后手动上传 NAS，不进 Git）
 ├── docker-compose.yml          # NAS 部署配置
 └── README.md
 ```
