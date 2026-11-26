@@ -58,11 +58,19 @@ export default function MaterialDetail({ materialId }) {
     } catch (e) { toast(e.message, 'err'); }
     finally { setBusy(''); }
   };
-  const genQuestions = async () => {
-    setBusy('questions');
+  const genQuestions = async (type) => {
+    setBusy(type === 'order' ? 'order' : 'questions');
     try {
-      const r = await api(`/api/materials/${materialId}/questions`, { method: 'POST', body: JSON.stringify({ count: Number(count), difficulty: 1 }) });
+      const r = await api(`/api/materials/${materialId}/questions`, { method: 'POST', body: JSON.stringify({ count: Number(count), difficulty: 1, ...(type ? { type } : {}) }) });
       toast(`已生成 ${r.created} 道题${r.failed ? `，${r.failed} 道失败` : ''}`, r.created ? 'ok' : 'err');
+    } catch (e) { toast(e.message, 'err'); }
+    finally { setBusy(''); }
+  };
+  const genCards = async () => {
+    setBusy('cards');
+    try {
+      const r = await api('/api/memory-cards/generate', { method: 'POST', body: JSON.stringify({ material_id: Number(materialId), count: 5 }) });
+      toast(r.generated ? `已生成 ${r.generated} 张记忆卡` : '该资料还没有可生成卡片的知识点', r.generated ? 'ok' : '');
     } catch (e) { toast(e.message, 'err'); }
     finally { setBusy(''); }
   };
@@ -102,11 +110,15 @@ export default function MaterialDetail({ materialId }) {
         <div className="row mt12" style={{ gap: 8, flexWrap: 'wrap' }}>
           <button className="btn sm" onClick={genSummary} disabled={!!busy}>{busy === 'summary' ? '生成中…' : '生成摘要'}</button>
           <button className="btn sm" onClick={build} disabled={!!busy}>{busy === 'build' ? '拆解中…' : '按资料拆清单'}</button>
+          <button className="btn sm" onClick={genCards} disabled={!!busy || !material.domain_id}>{busy === 'cards' ? '生成中…' : '生成记忆卡'}</button>
           <span className="row" style={{ gap: 6 }}>
             <input className="input" style={{ width: 70, padding: '8px' }} type="number" min={1} max={20} value={count}
               onChange={e => setCount(e.target.value)} />
-            <button className="btn sm" onClick={genQuestions} disabled={!!busy || !material.domain_id}>
+            <button className="btn sm" onClick={() => genQuestions()} disabled={!!busy || !material.domain_id}>
               {busy === 'questions' ? '出题中…' : '生成题目'}
+            </button>
+            <button className="btn sm" onClick={() => genQuestions('order')} disabled={!!busy || !material.domain_id}>
+              {busy === 'order' ? '出题中…' : '生成排序题'}
             </button>
           </span>
         </div>

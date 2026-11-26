@@ -88,12 +88,13 @@ export default function Building({ domainId }) {
           {STEPS.map((s, i) => (
             <div key={s.key} className="row"
               style={{ opacity: stepIdx >= i + 1 ? 1 : .35, transition: 'opacity .3s' }}>
-              <span style={{
+              <span key={`step-${i}-${stepIdx >= i + 1 ? 'done' : 'todo'}`} style={{
                 width: 26, height: 26, borderRadius: '50%', flexShrink: 0,
                 display: 'grid', placeItems: 'center', fontSize: '.8em',
                 background: stepIdx >= i + 1 ? 'var(--grad)' : 'var(--line)',
                 color: stepIdx >= i + 1 ? '#fff' : 'var(--ink-mute)',
-                transition: 'background .3s, color .3s',
+                transition: 'background .3s var(--ease-soft), color .3s var(--ease-soft)',
+                animation: stepIdx >= i + 1 ? 'badgePop .38s var(--ease-out-back) both' : 'none',
               }}>{stepIdx >= i + 1 ? '✓' : i + 1}</span>
               <span style={{ fontWeight: stepIdx >= i + 1 ? 600 : 400 }}>{s.label}</span>
               {stepIdx === i + 1 && phase === 'building' && i < STEPS.length - 1 && (

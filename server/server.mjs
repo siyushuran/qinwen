@@ -134,6 +134,18 @@ CREATE TABLE IF NOT EXISTS material_chunk (
   created_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_chunk_material ON material_chunk(material_id, idx);
+-- 记忆宫殿复习卡：一个知识点一张，缓存生成结果，避免每次复习都调模型
+CREATE TABLE IF NOT EXISTS memory_card (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  node_id INT NOT NULL UNIQUE,
+  material_id INT,
+  room TEXT NOT NULL,
+  hook TEXT DEFAULT '',
+  cue TEXT NOT NULL,
+  answer TEXT NOT NULL,
+  source_chunk_ids TEXT DEFAULT '[]',
+  created_at TEXT
+);
 `);
 
 // 旧库平滑升级：新增列不能影响已有数据
@@ -306,8 +318,8 @@ function promptExplain(question, userAnswer, isCorrect) {
   return `你是一位耐心的陪练老师。用户作答了下面这道题，判定结果：${isCorrect ? '答对' : '答错'}。
 题目：${question.stem}
 选项：${(question.options || []).join(' / ')}
-正确答案：${question.answer}
-用户作答：${userAnswer}
+ 正确答案：${question.type === 'order' ? parseOrderAnswer(question.answer).join(' → ') : question.answer}
+ 用户作答：${question.type === 'order' ? parseOrderAnswer(userAnswer).join(' → ') : userAnswer}
 请输出严格 JSON（不要 markdown）：
 {"judged":"对/错","explanation":"讲解：先点明对错，再讲清知识点本身，语气像朋友聊天，不要应试腔","followups":["建议的追问方向1","建议的追问方向2"]}`;
 }
@@ -317,8 +329,8 @@ function promptChat(question, history, nickname = '小问') {
   return `你是陪练老师「${nickname || '小问'}」。用户正在练习这道题：
 题干：${question.stem}
 选项：${(question.options || []).join(' / ')}
-正确答案：${question.answer}
-讲解：${question.explanation}
+ 正确答案：${question.type === 'order' ? parseOrderAnswer(question.answer).join(' → ') : question.answer}
+ 讲解：${question.explanation}
 历史对话：
 ${ctx}
 请回答用户的追问。要求：苏格拉底式引导，不直接甩答案，先从用户思路出发，逐步给线索；语气亲切自然，篇幅控制在 150 字以内。直接输出回复内容，不要 JSON。`;
@@ -445,6 +457,51 @@ ${ctx}
 ${src.slice(0, 22000)}`;
 }
 
+// 排序题：顺序是要考的关系知识，answer 与 options 必须同源，options 故意打乱
+function promptMakeOrderQuestion(nodeName, level, difficulty, interests, chunks = []) {
+  const src = chunks.slice(0, 5).map(c => `[${c.idx}] ${c.heading}\n${c.content.slice(0, 700)}`).join('\n\n');
+  return `你是一位出题老师。请围绕知识点「${nodeName}」（认知层级 ${level}，难度 ${difficulty}/5）出一道排序题${interests ? `，尽量融入：${interests}` : ''}${src ? '，且只依据下面的资料片段' : ''}。
+输出严格 JSON（不要 markdown）：
+{"type":"order","stem":"请把下列步骤按正确顺序排列","options":["乱序步骤C","乱序步骤A","乱序步骤B"],"answer":["正确步骤A","正确步骤B","正确步骤C"],"explanation":"解析，${src ? '必须引用资料编号如[2]，' : ''}简洁"}
+要求：3~6 个步骤；answer 是正确顺序的选项原文数组；options 与 answer 必须是同一组步骤但顺序打乱；每一步 5~80 字；不得有重复步骤；涉及争议主张必须写"根据文章"。
+${src ? `\n资料片段：\n${src.slice(0, 10000)}` : ''}`;
+}
+
+// 记忆宫殿卡：位置 + 意象 + 主动检索，不直接给答案的线索卡
+function promptMemoryCard(nodeName, chunks) {
+  const src = chunks.slice(0, 4).map(c => `[${c.idx}] ${c.heading}\n${c.content.slice(0, 700)}`).join('\n\n');
+  return `你在帮学习者制作一张「记忆宫殿」复习卡。知识点：「${nodeName}」。
+输出严格 JSON（不要 markdown）：
+{"room":"一间具体的位置，例如'图书馆的借阅台'","hook":"把知识点绑到房间里某个物件的荒诞但好记的意象，30字以内","cue":"只给线索的自测问题，不直接说答案，40字以内","answer":"一句话说清这个知识点${src ? '，并引用资料编号如[2]' : ''}","chunk_index":资料编号整数}
+要求：房间与意象必须具体、可想象；cue 要能在不看 answer 时唤起回忆；只使用资料信息，资料未写就不要编造。
+${src ? `\n资料片段：\n${src.slice(0, 9000)}` : '\n（无资料片段：只能基于知识点名称生成通用线索，answer 中不得伪装成原文依据）'}`;
+}
+
+// 交叉核验：只认给出的片段编号与逐字原文，杜绝模型凭空"确认"
+function promptCrossVerify(claim, evidence) {
+  return `你在做多来源交叉核验。待核验主张：「${claim}」。
+下面是若干资料片段，每段标注了资料 id、片段编号、章节与事实口径。请只依据这些片段判断该主张在各来源中是"支持 support"、"矛盾 contradict"还是"无关 unrelated"。
+输出严格 JSON（不要 markdown）：
+{"summary":"2~4 句总结：哪些来源支持、哪些矛盾、哪些没提到；争议内容必须带'文章称'","items":[{"material_id":1,"idx":2,"relation":"support","quote":"从该片段逐字摘录的原文短语，不超过80字","note":"一句话说明它如何支持或矛盾，40字以内"}]}
+硬性规则：
+- material_id 与 idx 必须是下面给出的真实编号，不得虚构；
+- quote 必须是该片段中逐字出现的原文，不得改写；
+- 每条 item 只写一个来源的一个片段，最多 8 条；
+- 没有任何相关片段时 items 返回空数组，summary 明确写"资料未覆盖"；
+- 口径为"文章声称，未经核实"的片段，note 必须以"文章称，"开头。
+
+资料片段：
+${evidence.slice(0, 22000)}`;
+}
+
+// 图片转文字：只描述看到的，看不清的进 uncertain，不靠常识补全
+function promptImageDescribe(hint) {
+  return `请仔细观察这张图片，把它转成可检索、可复习的文字资料。只描述你确实看到的内容；看不清的写进 uncertain，不要补全常识。
+输出严格 JSON（不要 markdown）：
+{"title":"给这张图起的简短标题","description":"3~5 句说清图片整体在讲什么","elements":["关键元素及其关系"],"texts":["图中可辨认的文字，逐字抄录"],"flow":["若为流程/步骤图，按图中顺序写出步骤"],"uncertain":["模糊、看不清或无法判断的部分"]}
+${hint ? `\n用户补充的上下文：${hint}` : ''}`;
+}
+
 // ---------- 题目出参规范化 ----------
 // options 在库中以 JSON 字符串存储，出参统一解析为数组，避免前端拿到字符串
 function normalizeQuestion(q) {
@@ -455,6 +512,21 @@ function normalizeQuestion(q) {
   }
   if (!Array.isArray(options)) options = [];
   return { ...q, options };
+}
+// 排序题答案统一为「选项原文数组」：库中存 JSON 字符串，用户提交也是 JSON 字符串
+function parseOrderAnswer(raw) {
+  if (Array.isArray(raw)) return raw.filter(x => typeof x === 'string').map(x => x.trim()).filter(Boolean);
+  if (typeof raw !== 'string') return [];
+  try {
+    const p = JSON.parse(raw);
+    if (Array.isArray(p)) return p.filter(x => typeof x === 'string').map(x => x.trim()).filter(Boolean);
+  } catch { /* 兼容非 JSON 提交，判错即可 */ }
+  return [];
+}
+function orderResult(given, correct) {
+  if (!given.length || given.length !== correct.length) return { correct: false, firstWrong: 0 };
+  for (let i = 0; i < correct.length; i++) if (given[i] !== correct[i]) return { correct: false, firstWrong: i };
+  return { correct: true, firstWrong: -1 };
 }
 function parseTags(raw) {
   try {
@@ -579,6 +651,7 @@ function purgeNodes(domainId) {
   db.prepare('DELETE FROM attempt WHERE node_id IN (SELECT id FROM node WHERE domain_id = ?)').run(domainId);
   db.prepare('DELETE FROM question WHERE node_id IN (SELECT id FROM node WHERE domain_id = ?)').run(domainId);
   db.prepare('DELETE FROM review_slot WHERE node_id IN (SELECT id FROM node WHERE domain_id = ?)').run(domainId);
+  db.prepare('DELETE FROM memory_card WHERE node_id IN (SELECT id FROM node WHERE domain_id = ?)').run(domainId);
   db.prepare('DELETE FROM progress WHERE domain_id = ?').run(domainId);
   db.prepare('DELETE FROM node WHERE domain_id = ?').run(domainId);
 }
@@ -966,9 +1039,11 @@ routes['POST /api/questions'] = async (req, res) => {
   const excludeIds = (Array.isArray(b.exclude_ids) ? b.exclude_ids : [])
     .map(Number).filter(n => Number.isInteger(n) && n > 0).slice(0, 20);
   await withNodeLock(node.id, async () => {
+    const wantOrder = b.type === 'order';
     // 普通出题沿用缓存；「下一题」优先复用库中还没见过的题，避免重复调用模型
+    // 排序题与普通题分开取缓存，避免点了「排序题」却拿到缓存里的单选题
     const cached = db.prepare('SELECT * FROM question WHERE node_id = ? AND difficulty = ? ORDER BY id').all(node.id, difficulty)
-      .find(q => !excludeIds.includes(q.id));
+      .find(q => (wantOrder ? q.type === 'order' : q.type !== 'order') && !excludeIds.includes(q.id));
     if (cached && (!forceNew || excludeIds.length > 0)) {
       transaction(() => saveProgress(node.domain_id, node.id, cached.id, difficulty));
       return json(res, 200, { question: publicQuestion(cached), cached: true });
@@ -982,24 +1057,37 @@ routes['POST /api/questions'] = async (req, res) => {
       const avoidStems = placeholders
         ? db.prepare(`SELECT stem FROM question WHERE id IN (${placeholders})`).all(...excludeIds).map(r => r.stem).filter(Boolean).slice(0, 8)
         : [];
-      const content = await llmChat([{ role: 'user', content: promptMakeQuestion(node.name, node.cognitive_level, difficulty, getSetting('interests') || '', avoidStems) }], { json: true });
+      const prompt = wantOrder
+        ? promptMakeOrderQuestion(node.name, node.cognitive_level, difficulty, getSetting('interests') || '')
+        : promptMakeQuestion(node.name, node.cognitive_level, difficulty, getSetting('interests') || '', avoidStems);
+      const content = await llmChat([{ role: 'user', content: prompt }], { json: true });
       const q = JSON.parse(content);
       // 模型输出不可信：结构、数量、长度都要校验后再落库
       if (!q || typeof q !== 'object' || typeof q.stem !== 'string' || !q.stem.trim()) throw new Error('invalid question');
-      const type = q.type === 'judge' ? 'judge' : 'single';
-      const rawOptions = (Array.isArray(q.options) ? q.options : [])
-        .filter(o => typeof o === 'string' && o.trim()).slice(0, 6)
-        .map(o => o.trim().slice(0, 300));
-      const options = type === 'judge' ? ['正确', '错误'] : [...new Set(rawOptions)];
-      const answer = typeof q.answer === 'string' ? q.answer.trim().slice(0, 300) : '';
-      if (options.length < 2 || !answer) throw new Error('invalid options or answer');
-      if (type === 'judge' && !['正确', '错误', 'A', 'B'].includes(answer)) throw new Error('invalid judge answer');
-      // 答案必须能定位到某个选项，否则这道题永远判错；这类脏数据宁可不落库
-      if (answerIndex(answer, options, true) < 0) throw new Error('answer not in options');
+      let type, options, answer;
+      if (wantOrder) {
+        if (q.type !== 'order') throw new Error('not an order question');
+        options = (Array.isArray(q.options) ? q.options : []).filter(o => typeof o === 'string' && o.trim()).map(o => o.trim().slice(0, 120)).slice(0, 6);
+        const steps = parseOrderAnswer(q.answer).slice(0, 6);
+        if (options.length < 3 || steps.length !== options.length) throw new Error('invalid order steps');
+        if (new Set(options).size !== options.length || steps.some(s => !options.includes(s))) throw new Error('order mismatch');
+        type = 'order'; answer = JSON.stringify(steps);
+      } else {
+        type = q.type === 'judge' ? 'judge' : 'single';
+        const rawOptions = (Array.isArray(q.options) ? q.options : [])
+          .filter(o => typeof o === 'string' && o.trim()).slice(0, 6)
+          .map(o => o.trim().slice(0, 300));
+        options = type === 'judge' ? ['正确', '错误'] : [...new Set(rawOptions)];
+        answer = typeof q.answer === 'string' ? q.answer.trim().slice(0, 300) : '';
+        if (options.length < 2 || !answer) throw new Error('invalid options or answer');
+        if (type === 'judge' && !['正确', '错误', 'A', 'B'].includes(answer)) throw new Error('invalid judge answer');
+        // 答案必须能定位到某个选项，否则这道题永远判错；这类脏数据宁可不落库
+        if (answerIndex(answer, options, true) < 0) throw new Error('answer not in options');
+      }
       row = transaction(() => {
         const r = db.prepare('INSERT INTO question (node_id, type, difficulty, stem, options, answer, explanation, model, prompt_ver, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
           .run(node.id, type, difficulty, q.stem.slice(0, 1000), JSON.stringify(options), answer,
-            typeof q.explanation === 'string' ? q.explanation.slice(0, 4000) : '', llmConfig().chat_model, PROMPT_VER, now());
+            typeof q.explanation === 'string' ? q.explanation.slice(0, 4000) : '', llmConfig().chat_model, wantOrder ? PROMPT_VER + '-order' : PROMPT_VER, now());
         const inserted = db.prepare('SELECT * FROM question WHERE id = ?').get(r.lastInsertRowid);
         saveProgress(node.domain_id, node.id, inserted.id, difficulty);
         return inserted;
@@ -1043,9 +1131,12 @@ routes['POST /api/attempts'] = async (req, res) => {
   const b = await readBody(req);
   const q = normalizeQuestion(db.prepare('SELECT * FROM question WHERE id = ?').get(intIn(b.question_id, 1, 2147483647, 0)));
   if (!q) return json(res, 404, { error: '题目不存在' });
-  const answerGiven = text(b.answer, 500);
+  const isOrder = q.type === 'order';
+  const answerGiven = text(b.answer, isOrder ? 4000 : 500);
   const durationMs = intIn(b.duration_ms, 0, 86400000, 0);
-  const isCorrect = answerIndex(answerGiven, q.options, false) === answerIndex(q.answer, q.options, true) ? 1 : 0;
+  const orderInfo = isOrder ? orderResult(parseOrderAnswer(answerGiven), parseOrderAnswer(q.answer)) : null;
+  const isCorrect = isOrder ? (orderInfo.correct ? 1 : 0)
+    : (answerIndex(answerGiven, q.options, false) === answerIndex(q.answer, q.options, true) ? 1 : 0);
   const errorTags = cleanTags(b.error_tags);
 
   // 讲解先生成（含 await），写库阶段不留跨 await 的读-改-写窗口
@@ -1108,10 +1199,12 @@ routes['POST /api/attempts'] = async (req, res) => {
   });
 
   // 只有在提交作答后，才告诉前端正确选项在哪
-  const correctIndex = answerIndex(q.answer, q.options, true);
+  const correctIndex = isOrder ? -1 : answerIndex(q.answer, q.options, true);
   json(res, 200, {
     ok: true, attempt_id: state.attemptId, is_correct: isCorrect,
-    correct_index: correctIndex, explanation, followups, mastery: state.mastery,
+    correct_index: correctIndex,
+    ...(isOrder ? { correct_order: parseOrderAnswer(q.answer), first_wrong: orderInfo.firstWrong } : {}),
+    explanation, followups, mastery: state.mastery,
   });
 };
 
@@ -1347,6 +1440,21 @@ routes['GET /api/materials'] = (req, res) => {
   const rows = db.prepare('SELECT * FROM material ORDER BY id DESC').all().map(materialPublic);
   json(res, 200, { materials: rows });
 };
+// 所有资料入口共用同一条落库链路：哈希幂等 → 切块 → 事务写入
+function createMaterial({ title, source = '', content, domainId = null, claimPolicy = 'article_claim', sourceType = 'article' }) {
+  const hash = contentHash(content);
+  const dup = db.prepare('SELECT * FROM material WHERE content_hash = ? ORDER BY id LIMIT 1').get(hash);
+  if (dup) return { material: materialPublic(dup), reused: true };
+  const chunks = splitMaterial(content);
+  if (!chunks.length) fail(400, '资料切块为空');
+  const id = transaction(() => {
+    const r = db.prepare('INSERT INTO material (domain_id, title, source_url, source_type, content_hash, claim_policy, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(domainId, title, source, ['article', 'note', 'doc', 'image'].includes(sourceType) ? sourceType : 'article', hash, claimPolicy, '', now());
+    storeChunks(Number(r.lastInsertRowid), chunks, claimPolicy);
+    return Number(r.lastInsertRowid);
+  });
+  return { material: materialPublic(db.prepare('SELECT * FROM material WHERE id = ?').get(id)), reused: false };
+}
 routes['POST /api/materials'] = async (req, res) => {
   if (!authed(req)) return json(res, 401, { error: '未登录' });
   limitOrThrow(req, 'material-create', 10, 60 * 1000);
@@ -1359,18 +1467,55 @@ routes['POST /api/materials'] = async (req, res) => {
   if (!title) return json(res, 400, { error: '资料标题不能为空' });
   if (!content) return json(res, 400, { error: '资料内容不能为空' });
   if (domainId && !db.prepare('SELECT 1 FROM domain WHERE id = ?').get(domainId)) return json(res, 404, { error: '领域不存在' });
-  const hash = contentHash(content);
-  const dup = db.prepare('SELECT * FROM material WHERE content_hash = ? ORDER BY id LIMIT 1').get(hash);
-  if (dup) return json(res, 200, { ok: true, reused: true, material: materialPublic(dup) });
-  const chunks = splitMaterial(content);
-  if (!chunks.length) return json(res, 400, { error: '资料切块为空' });
-  const id = transaction(() => {
-    const r = db.prepare('INSERT INTO material (domain_id, title, source_url, source_type, content_hash, claim_policy, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(domainId, title, source, ['article', 'note', 'doc'].includes(b.source_type) ? b.source_type : 'article', hash, claimPolicy, '', now());
-    storeChunks(Number(r.lastInsertRowid), chunks, claimPolicy);
-    return Number(r.lastInsertRowid);
-  });
-  json(res, 200, { ok: true, reused: false, material: materialPublic(db.prepare('SELECT * FROM material WHERE id = ?').get(id)) });
+  const created = createMaterial({ title, source, content, domainId, claimPolicy, sourceType: b.source_type });
+  json(res, 200, { ok: true, ...created });
+};
+// 图片资料：视觉模型输出结构化描述 → 同一条资料流水线。看不清的部分保留在 uncertain，不编造。
+routes['POST /api/materials/image'] = async (req, res) => {
+  if (!authed(req)) return json(res, 401, { error: '未登录' });
+  limitOrThrow(req, 'material-image', 10, 60 * 1000);
+  const b = await readBody(req, 6e6);
+  const dataUri = typeof b.image === 'string' ? b.image : '';
+  const match = dataUri.match(/^data:image\/(png|jpeg|jpg|webp|gif);base64,([A-Za-z0-9+/=]+)$/);
+  if (!match) return json(res, 400, { error: '仅支持 PNG / JPEG / WebP / GIF 的 data URL 图片' });
+  if (match[2].length > 5e6) return json(res, 413, { error: '图片过大，请使用 3MB 以内的图片' });
+  if (!modelAvailable()) return json(res, 500, { error: '模型未配置：请先在设置页填写模型配置' });
+  let data;
+  try {
+    const content = await llmChat([{ role: 'user', content: [
+      { type: 'text', text: promptImageDescribe(text(b.hint, 400)) },
+      { type: 'image_url', image_url: { url: dataUri } },
+    ] }], { json: true, model: 'fast' });
+    data = JSON.parse(content);
+  } catch {
+    return json(res, 502, { error: '图片描述失败：当前模型可能不支持视觉输入，或输出不可用' });
+  }
+  if (!data || typeof data !== 'object' || typeof data.description !== 'string' || !data.description.trim()) {
+    return json(res, 502, { error: '图片描述失败：模型输出为空或格式异常' });
+  }
+  const list = key => (Array.isArray(data[key]) ? data[key] : []).filter(x => typeof x === 'string' && x.trim()).slice(0, 20).map(x => x.slice(0, 300));
+  const lines = [`# ${(typeof data.title === 'string' && data.title.trim() ? data.title.trim() : '图片资料').slice(0, 120)}`, '', '> 由视觉模型转写，需与原图核对；未经独立核实。', '', '## 画面概述', data.description.slice(0, 2000), ''];
+  const section = (name, key, ordered) => {
+    const items = list(key);
+    if (!items.length) return;
+    lines.push(`## ${name}`, '');
+    items.forEach((x, i) => lines.push(ordered ? `${i + 1}. ${x}` : `- ${x}`));
+    lines.push('');
+  };
+  section('关键元素', 'elements', false);
+  section('图中文字', 'texts', false);
+  section('流程 / 步骤', 'flow', true);
+  section('不确定 / 未识别', 'uncertain', false);
+  const ext = match[1] === 'jpeg' ? 'jpg' : match[1];
+  const uploadDir = path.join(DATA_DIR, 'uploads');
+  fs.mkdirSync(uploadDir, { recursive: true });
+  const file = `${contentHash(match[2])}.${ext}`;
+  fs.writeFileSync(path.join(uploadDir, file), Buffer.from(match[2], 'base64'));
+  const imageUrl = `/uploads/${file}`;
+  const title = text(b.title, 120).trim() || (typeof data.title === 'string' ? data.title.trim().slice(0, 120) : '') || '图片资料';
+  const created = createMaterial({ title, source: imageUrl, content: lines.join('\n').trim(),
+    domainId: intIn(b.domain_id, 1, 2147483647, null), claimPolicy: 'article_claim', sourceType: 'image' });
+  json(res, 200, { ok: true, ...created, image_url: imageUrl, uncertain: list('uncertain') });
 };
 routes['GET /api/materials/:id'] = (req, res, m) => {
   if (!authed(req)) return json(res, 401, { error: '未登录' });
@@ -1385,6 +1530,7 @@ routes['DELETE /api/materials/:id'] = (req, res, m) => {
     db.prepare('UPDATE question SET material_id = NULL, chunk_id = NULL WHERE material_id = ?').run(material.id);
     db.prepare('UPDATE chat_turn SET material_id = NULL WHERE material_id = ?').run(material.id);
     db.prepare('UPDATE highlight SET material_id = NULL, chunk_id = NULL WHERE material_id = ?').run(material.id);
+    db.prepare('DELETE FROM memory_card WHERE material_id = ?').run(material.id);
     db.prepare('DELETE FROM material_chunk WHERE material_id = ?').run(material.id);
     db.prepare('DELETE FROM material WHERE id = ?').run(material.id);
   });
@@ -1453,6 +1599,7 @@ routes['POST /api/materials/:id/build'] = async (req, res, m) => {
       db.prepare(`DELETE FROM attempt WHERE node_id IN (${ph})`).run(...old);
       db.prepare(`DELETE FROM question WHERE node_id IN (${ph})`).run(...old);
       db.prepare(`DELETE FROM review_slot WHERE node_id IN (${ph})`).run(...old);
+      db.prepare(`DELETE FROM memory_card WHERE node_id IN (${ph})`).run(...old);
       db.prepare(`DELETE FROM progress WHERE node_id IN (${ph})`).run(...old);
       db.prepare(`DELETE FROM node WHERE id IN (${ph})`).run(...old);
     }
@@ -1491,20 +1638,34 @@ routes['POST /api/materials/:id/questions'] = async (req, res, m) => {
     const node = nodes[i % nodes.length];
     const picked = retrieveChunks(chunks, node.name, 6);
     try {
-      const content = await llmChat([{ role: 'user', content: promptMaterialQuestion(node.name, node.cognitive_level, difficulty, picked, interests) }], { json: true });
+      const wantOrder = b.type === 'order';
+      const prompt = wantOrder
+        ? promptMakeOrderQuestion(node.name, node.cognitive_level, difficulty, interests, picked)
+        : promptMaterialQuestion(node.name, node.cognitive_level, difficulty, picked, interests);
+      const content = await llmChat([{ role: 'user', content: prompt }], { json: true });
       const q = JSON.parse(content);
       if (!q || typeof q.stem !== 'string' || !q.stem.trim()) throw new Error('invalid stem');
-      const type = q.type === 'judge' ? 'judge' : 'single';
-      const rawOptions = (Array.isArray(q.options) ? q.options : []).filter(o => typeof o === 'string' && o.trim()).slice(0, 6).map(o => o.trim().slice(0, 300));
-      const options = type === 'judge' ? ['正确', '错误'] : [...new Set(rawOptions)];
-      const answer = typeof q.answer === 'string' ? q.answer.trim().slice(0, 300) : '';
-      if (options.length < 2 || !answer || answerIndex(answer, options, true) < 0) throw new Error('invalid answer');
+      let type, options, answer;
+      if (wantOrder) {
+        if (q.type !== 'order') throw new Error('not an order question');
+        options = (Array.isArray(q.options) ? q.options : []).filter(o => typeof o === 'string' && o.trim()).map(o => o.trim().slice(0, 120)).slice(0, 6);
+        const steps = parseOrderAnswer(q.answer).slice(0, 6);
+        if (options.length < 3 || steps.length !== options.length) throw new Error('invalid order steps');
+        if (new Set(options).size !== options.length || steps.some(s => !options.includes(s))) throw new Error('order mismatch');
+        type = 'order'; answer = JSON.stringify(steps);
+      } else {
+        type = q.type === 'judge' ? 'judge' : 'single';
+        const rawOptions = (Array.isArray(q.options) ? q.options : []).filter(o => typeof o === 'string' && o.trim()).slice(0, 6).map(o => o.trim().slice(0, 300));
+        options = type === 'judge' ? ['正确', '错误'] : [...new Set(rawOptions)];
+        answer = typeof q.answer === 'string' ? q.answer.trim().slice(0, 300) : '';
+        if (options.length < 2 || !answer || answerIndex(answer, options, true) < 0) throw new Error('invalid answer');
+      }
       const idx = intIn(q.chunk_index, 0, 10000, picked[0]?.idx ?? 0);
       const chunk = chunks.find(c => c.idx === idx) || picked[0];
       const row = transaction(() => {
         const r = db.prepare('INSERT INTO question (node_id, type, difficulty, stem, options, answer, explanation, model, prompt_ver, created_at, source_key, source_url, source_type, material_id, chunk_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
           .run(node.id, type, difficulty, q.stem.slice(0, 1000), JSON.stringify(options), answer,
-            typeof q.explanation === 'string' ? q.explanation.slice(0, 4000) : '', llmConfig().chat_model, PROMPT_VER + '-material-v1', now(),
+            typeof q.explanation === 'string' ? q.explanation.slice(0, 4000) : '', llmConfig().chat_model, PROMPT_VER + (wantOrder ? '-order' : '-material-v1'), now(),
             `article://material/${material.id}/q/${crypto.randomBytes(8).toString('hex')}`, material.source_url || '', 'material', material.id, chunk?.id || null);
         return Number(r.lastInsertRowid);
       });
@@ -1513,6 +1674,127 @@ routes['POST /api/materials/:id/questions'] = async (req, res, m) => {
   }
   json(res, 200, { ok: true, created: created.length, failed: failed.length, questions: created });
 };
+// 多文档交叉核验：每篇资料先按主张召回片段，模型判断后逐条回溯真实原文
+routes['POST /api/materials/verify'] = async (req, res) => {
+  if (!authed(req)) return json(res, 401, { error: '未登录' });
+  limitOrThrow(req, 'verify', 10, 60 * 1000);
+  const b = await readBody(req);
+  const claim = text(b.claim, 500).trim();
+  if (!claim) return json(res, 400, { error: '请填写要核验的主张' });
+  let materials = db.prepare('SELECT id, title, source_url FROM material ORDER BY id').all();
+  if (Array.isArray(b.material_ids) && b.material_ids.length) {
+    const ids = b.material_ids.map(Number).filter(n => Number.isInteger(n) && n > 0).slice(0, 8);
+    materials = materials.filter(m => ids.includes(m.id));
+  } else materials = materials.slice(0, 8);
+  if (!materials.length) return json(res, 400, { error: '没有可核验的资料' });
+  if (!modelAvailable()) return json(res, 500, { error: '模型未配置：请先在设置页填写模型配置' });
+  const sources = [], blocks = [];
+  for (const material of materials) {
+    const chunks = db.prepare('SELECT * FROM material_chunk WHERE material_id = ? ORDER BY idx').all(material.id);
+    for (const c of retrieveChunks(chunks, claim, 3)) {
+      sources.push({ material_id: material.id, idx: c.idx, heading: c.heading, content: c.content,
+        claim_status: c.claim_status, source_url: material.source_url });
+      blocks.push(`资料 id=${material.id} 标题「${material.title}」片段编号=${c.idx} 章节「${c.heading}」口径=${c.claim_status === 'article_claim' ? '文章声称，未经核实' : '资料原文'}\n${c.content.slice(0, 700)}`);
+    }
+  }
+  if (!sources.length) return json(res, 200, { claim, summary: '资料里没有可用片段，无法核验。', items: [], covered: false });
+  let parsed;
+  try {
+    parsed = JSON.parse(await llmChat([{ role: 'user', content: promptCrossVerify(claim, blocks.join('\n\n---\n\n')) }], { json: true, model: 'fast' }));
+  } catch { return json(res, 502, { error: '核验失败：模型输出不可用，请重试' }); }
+  const items = [];
+  for (const it of (Array.isArray(parsed?.items) ? parsed.items : []).slice(0, 8)) {
+    const mid = Number(it?.material_id), idx = Number(it?.idx);
+    const src = sources.find(s => s.material_id === mid && s.idx === idx);
+    if (!src) continue;
+    const quote = text(it.quote, 80).trim();
+    if (!quote || !src.content.includes(quote)) continue; // 引用必须逐字命中，杜绝模型伪造证据
+    const relation = ['support', 'contradict', 'unrelated'].includes(it.relation) ? it.relation : 'unrelated';
+    let note = text(it.note, 120).trim();
+    if (src.claim_status === 'article_claim' && !note.startsWith('文章称')) note = `文章称，${note}`;
+    items.push({ material_id: mid, idx, heading: src.heading, relation, quote, note, source_url: src.source_url });
+  }
+  json(res, 200, { claim, summary: text(parsed?.summary, 800) || '未给出总结。', items,
+    covered: items.length > 0, sources_checked: sources.length });
+};
+
+// 记忆宫殿复习卡：位置线索 → 自测线索 → 揭示答案 → 自评驱动既有 SRS
+routes['GET /api/memory-cards'] = (req, res) => {
+  if (!authed(req)) return json(res, 401, { error: '未登录' });
+  const rows = db.prepare(`SELECT c.*, n.name AS node_name, n.domain_id, d.name AS domain_name,
+    r.due_at FROM memory_card c JOIN node n ON n.id = c.node_id
+    LEFT JOIN domain d ON d.id = n.domain_id LEFT JOIN review_slot r ON r.node_id = c.node_id
+    ORDER BY (r.due_at IS NULL), r.due_at, c.id LIMIT 100`).all();
+  json(res, 200, { cards: rows.map(c => {
+    let ids = []; try { ids = JSON.parse(c.source_chunk_ids || '[]').map(Number); } catch { /* 兼容旧数据 */ }
+    return { ...c, source_chunk_ids: ids };
+  }) });
+};
+routes['POST /api/memory-cards/generate'] = async (req, res) => {
+  if (!authed(req)) return json(res, 401, { error: '未登录' });
+  limitOrThrow(req, 'memory-generate', 10, 60 * 1000);
+  const b = await readBody(req);
+  const nodeId = intIn(b.node_id, 1, 2147483647, 0);
+  const materialId = intIn(b.material_id, 1, 2147483647, 0);
+  const count = intIn(b.count, 1, 20, 5);
+  let nodes = [];
+  if (nodeId) {
+    const one = db.prepare('SELECT * FROM node WHERE id = ?').get(nodeId);
+    if (!one) return json(res, 404, { error: '知识点不存在' });
+    nodes = [one];
+  } else if (materialId) {
+    const m = db.prepare('SELECT * FROM material WHERE id = ?').get(materialId);
+    if (!m) return json(res, 404, { error: '资料不存在' });
+    nodes = db.prepare('SELECT * FROM node WHERE domain_id = ? AND parent_id IS NOT NULL ORDER BY id LIMIT ?').all(m.domain_id, count);
+  } else {
+    nodes = db.prepare(`SELECT n.* FROM review_slot r JOIN node n ON n.id = r.node_id
+      WHERE r.due_at <= ? AND n.status = 'active' ORDER BY r.due_at LIMIT ?`).all(now(), count);
+  }
+  if (!nodes.length) return json(res, 200, { ok: true, generated: 0, message: '当前没有待做卡片的知识点' });
+  if (!modelAvailable()) return json(res, 500, { error: '模型未配置：请先在设置页填写模型配置' });
+  let generated = 0, reused = 0;
+  for (const node of nodes) {
+    if (db.prepare('SELECT 1 FROM memory_card WHERE node_id = ?').get(node.id)) { reused++; continue; }
+    const material = db.prepare('SELECT * FROM material WHERE domain_id = ? ORDER BY id LIMIT 1').get(node.domain_id);
+    const chunks = material ? db.prepare('SELECT * FROM material_chunk WHERE material_id = ? ORDER BY idx').all(material.id) : [];
+    const picked = chunks.length ? retrieveChunks(chunks, node.name, 4) : [];
+    try {
+      const d = JSON.parse(await llmChat([{ role: 'user', content: promptMemoryCard(node.name, picked) }], { json: true, model: 'fast' }));
+      const room = text(d.room, 80).trim(), hook = text(d.hook, 120).trim(), cue = text(d.cue, 160).trim();
+      let answer = text(d.answer, 400).trim();
+      if (!room || !cue || !answer) continue;
+      const idx = intIn(d.chunk_index, 0, 10000, picked[0]?.idx ?? 0);
+      const chunk = picked.find(c => c.idx === idx) || picked[0];
+      if (chunk && !answer.includes(`[${idx}]`)) answer += `（依据：[${idx}]）`;
+      const r = db.prepare('INSERT OR IGNORE INTO memory_card (node_id, material_id, room, hook, cue, answer, source_chunk_ids, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(node.id, material?.id || null, room, hook, cue, answer, JSON.stringify(chunk ? [chunk.id] : []), now());
+      generated += r.changes;
+    } catch { /* 单张失败不影响其他卡片 */ }
+  }
+  json(res, 200, { ok: true, generated, reused });
+};
+routes['POST /api/memory-cards/:id/review'] = async (req, res, m) => {
+  if (!authed(req)) return json(res, 401, { error: '未登录' });
+  const id = intIn(m.id, 1, 2147483647, 0);
+  const card = db.prepare('SELECT * FROM memory_card WHERE id = ?').get(id);
+  if (!card) return json(res, 404, { error: '卡片不存在' });
+  const b = await readBody(req);
+  const remembered = b.remembered === true || b.remembered === 'true';
+  const slot = db.prepare('SELECT * FROM review_slot WHERE node_id = ?').get(card.node_id);
+  let ease = slot ? slot.ease : 2.5;
+  const interval = remembered ? (slot ? Math.max(1, Math.round(slot.interval_days * ease)) : 2) : 1;
+  ease = remembered ? Math.min(3.2, ease + 0.15) : Math.max(1.3, ease - 0.2);
+  const due = new Date(Date.now() + interval * 86400000).toISOString();
+  const node = db.prepare('SELECT mastery FROM node WHERE id = ?').get(card.node_id);
+  const mastery = Math.max(0, Math.min(1, (node?.mastery || 0) + (remembered ? 0.1 : -0.1)));
+  transaction(() => {
+    db.prepare('INSERT INTO review_slot (node_id, due_at, interval_days, ease) VALUES (?, ?, ?, ?) ON CONFLICT(node_id) DO UPDATE SET due_at = excluded.due_at, interval_days = excluded.interval_days, ease = excluded.ease')
+      .run(card.node_id, due, interval, ease);
+    db.prepare('UPDATE node SET mastery = ? WHERE id = ?').run(mastery, card.node_id);
+  });
+  json(res, 200, { ok: true, remembered, next_due: due, interval_days: interval, mastery });
+};
+
 routes['POST /api/materials/:id/chat'] = async (req, res, m) => {
   if (!authed(req)) return json(res, 401, { error: '未登录' });
   limitOrThrow(req, 'material-chat', 20, 60 * 1000);
@@ -1707,6 +1989,21 @@ routes['GET /api/export'] = async (req, res) => {
 async function handleRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const pathname = url.pathname;
+
+  // 图片资料原图：限制在 DATA_DIR/uploads 内，路径越界直接拒绝
+  if (pathname.startsWith('/uploads/')) {
+    const root = path.resolve(DATA_DIR, 'uploads');
+    const file = path.resolve(root, `.${pathname.slice('/uploads'.length)}`);
+    if (file === root || !file.startsWith(root + path.sep) || !fs.existsSync(file) || !fs.statSync(file).isFile()) {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('404'); return;
+    }
+    const ext = path.extname(file).toLowerCase();
+    const types = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif' };
+    const stat = fs.statSync(file);
+    res.writeHead(200, { 'Content-Type': types[ext] || 'application/octet-stream', 'Cache-Control': 'public, max-age=86400', 'Content-Length': stat.size });
+    fs.createReadStream(file).pipe(res);
+    return;
+  }
 
   // 静态文件 + SPA 回退
   if (!pathname.startsWith('/api/')) {

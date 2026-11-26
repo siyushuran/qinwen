@@ -10,6 +10,14 @@ export default function Materials() {
   const [content, setContent] = useState('');
   const [policy, setPolicy] = useState('article_claim');
   const [busy, setBusy] = useState(false);
+  const [imageData, setImageData] = useState('');
+  const [imageName, setImageName] = useState('');
+  const [imageHint, setImageHint] = useState('');
+  const [busyImage, setBusyImage] = useState(false);
+  const [claim, setClaim] = useState('');
+  const [verifyIds, setVerifyIds] = useState([]);
+  const [verifyResult, setVerifyResult] = useState(null);
+  const [busyVerify, setBusyVerify] = useState(false);
 
   const load = async () => {
     try {
@@ -33,6 +41,38 @@ export default function Materials() {
       navigate(`/material/${r.material.id}`);
     } catch (err) { toast(err.message, 'err'); }
     finally { setBusy(false); }
+  };
+
+  const pickImage = (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    setImageName(f.name);
+    const reader = new FileReader();
+    reader.onload = () => setImageData(String(reader.result || ''));
+    reader.readAsDataURL(f);
+  };
+  const uploadImage = async () => {
+    if (!imageData) return toast('请先选择图片', 'err');
+    setBusyImage(true);
+    try {
+      const r = await api('/api/materials/image', { method: 'POST', body: JSON.stringify({
+        image: imageData, title: imageName.replace(/\.[^.]+$/, ''), hint: imageHint,
+      }) });
+      toast(r.reused ? '这张图已导入过' : '图片已转写成资料', 'ok');
+      setImageData(''); setImageName(''); setImageHint('');
+      load();
+      navigate(`/material/${r.material.id}`);
+    } catch (e) { toast(e.message, 'err'); }
+    finally { setBusyImage(false); }
+  };
+  const verify = async () => {
+    if (!claim.trim()) return toast('请填写要核验的主张', 'err');
+    setBusyVerify(true);
+    try {
+      const r = await api('/api/materials/verify', { method: 'POST', body: JSON.stringify({ claim: claim.trim(), material_ids: verifyIds }) });
+      setVerifyResult(r);
+    } catch (e) { toast(e.message, 'err'); }
+    finally { setBusyVerify(false); }
   };
 
   const remove = async (id, name) => {
@@ -73,6 +113,60 @@ export default function Materials() {
           </div>
           <button className="btn primary block" disabled={busy}>{busy ? '正在切块入库…' : '导入资料'}</button>
         </form>
+      </div>
+
+      <div className="card enter">
+        <h2>🖼️ 图片转资料</h2>
+        <p className="sub mb12">上传截图或流程图，由视觉模型转成文字快照后按资料使用；看不清的部分会单独列出</p>
+        <div className="field">
+          <label>图片文件（PNG / JPEG / WebP / GIF，3MB 内）</label>
+          <input className="input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={pickImage} />
+        </div>
+        {imageData && <p className="small muted">已选择：{imageName}（约 {(imageData.length / 1024).toFixed(0)} KB）</p>}
+        <div className="field">
+          <label>上下文提示（可选）</label>
+          <input className="input" value={imageHint} onChange={e => setImageHint(e.target.value)} placeholder="例如：这是文章第三步的流程图截图" />
+        </div>
+        <button className="btn block" disabled={busyImage || !imageData} onClick={uploadImage}>{busyImage ? '正在识别图片…' : '识别并入库'}</button>
+      </div>
+
+      <div className="card enter">
+        <h2>🔍 多文档交叉核验</h2>
+        <p className="sub mb12">输入一个主张，系统从各篇资料召回原文片段，逐条标注支持 / 矛盾 / 无关并附引用</p>
+        <div className="field">
+          <label>待核验主张</label>
+          <textarea className="input" rows={3} value={claim} onChange={e => setClaim(e.target.value)} placeholder="例如：文章称黎曼猜想已被攻克" />
+        </div>
+        {items.length > 0 && (
+          <div className="field">
+            <label>核验范围（不选则全部资料）</label>
+            <div className="chips">
+              {items.map(it => (
+                <button key={it.id} className={`chip ${verifyIds.includes(it.id) ? 'on' : ''}`}
+                  onClick={() => setVerifyIds(verifyIds.includes(it.id) ? verifyIds.filter(x => x !== it.id) : [...verifyIds, it.id])}>
+                  {it.title}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        <button className="btn block" disabled={busyVerify || !claim.trim()} onClick={verify}>{busyVerify ? '正在比对…' : '开始核验'}</button>
+        {verifyResult && (
+          <div className="verify-result mt12">
+            <p style={{ lineHeight: 1.7 }}>{verifyResult.summary}</p>
+            <p className="muted small mt8">比对 {verifyResult.sources_checked} 个片段 · {verifyResult.covered ? '找到相关原文' : '资料未覆盖'}</p>
+            {(verifyResult.items || []).map((it, i) => (
+              <div key={i} className="verify-item mt8">
+                <div className="row" style={{ gap: 8 }}>
+                  <span className={`chip ${it.relation === 'support' ? 'on' : ''}`}>{it.relation === 'support' ? '支持' : it.relation === 'contradict' ? '矛盾' : '无关'}</span>
+                  <span className="muted small">{it.heading} [{it.idx}]</span>
+                </div>
+                <p className="small mt8">“{it.quote}”</p>
+                <p className="small muted">{it.note}</p>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="card enter-d1">

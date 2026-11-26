@@ -13,6 +13,7 @@ import Stats from './pages/Stats.jsx';
 import Highlights from './pages/Highlights.jsx';
 import Materials from './pages/Materials.jsx';
 import MaterialDetail from './pages/MaterialDetail.jsx';
+import Palace from './pages/Palace.jsx';
 import Settings from './pages/Settings.jsx';
 
 // 极简 hash 路由（自用轻量，避免引入路由库）
@@ -65,6 +66,7 @@ export default function App() {
   if (pathname === '/' || pathname === '') page = <Home />;
   else if (pathname === '/materials') page = <Materials />;
   else if (pathname.startsWith('/material/')) page = <MaterialDetail materialId={pathname.split('/')[2]} />;
+  else if (pathname === '/palace') page = <Palace />;
   else if (pathname.startsWith('/domains/new')) page = <DomainNew />;
   else if (pathname.startsWith('/building/')) page = <Building domainId={pathname.split('/')[2]} />;
   else if (pathname.startsWith('/learn/')) page = (
@@ -91,7 +93,7 @@ export default function App() {
             {pathname !== '/settings' && <button className="btn ghost sm" onClick={() => navigate('/settings')}>设置</button>}
           </div>
         </header>
-        <main>{page}</main>
+        <main key={pathname} className="scene-enter">{page}</main>
       </div>
       <nav className="tabbar">
         <div className="inner">

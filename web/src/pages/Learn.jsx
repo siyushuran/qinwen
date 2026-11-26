@@ -11,6 +11,7 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
   const [question, setQuestion] = useState(null);
   const [phase, setPhase] = useState('idle'); // idle | asking | ready | judging | done
   const [selected, setSelected] = useState(null);
+  const [orderDraft, setOrderDraft] = useState([]); // 排序题：用户点选出的顺序
   const [result, setResult] = useState(null);
   const [errorTags, setErrorTags] = useState([]);
   const [tagsSaved, setTagsSaved] = useState(false);
@@ -35,7 +36,7 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
 
   const loadDomain = async () => {
     seenIdsRef.current = [];
-    setSelected(null); setResult(null); setErrorTags([]); setFollowups([]); setChat([]); setTagsSaved(false);
+    setSelected(null); setOrderDraft([]); setResult(null); setErrorTags([]); setFollowups([]); setChat([]); setTagsSaved(false);
     try {
       const data = await api(`/api/domains/${domainId}`);
       const active = data.nodes.filter(n => n.status === 'active');
@@ -49,6 +50,7 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
           const q = r.question;
           if (q && active.some(n => n.id === q.node_id) && (!focusNode || q.node_id === Number(focusNode))) {
             seenIdsRef.current = [q.id];
+            setOrderDraft([]);
             setQuestion(q);
             setDifficulty(q.difficulty || 1);
             askStartRef.current = Date.now();
@@ -91,7 +93,7 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
 
   const ask = async (nodeId, diff = null, opts = {}) => {
     setPhase('asking');
-    setSelected(null); setResult(null); setErrorTags([]); setFollowups([]); setChat([]); setTagsSaved(false);
+    setSelected(null); setOrderDraft([]); setResult(null); setErrorTags([]); setFollowups([]); setChat([]); setTagsSaved(false);
     if (diff) setDifficulty(diff);
     askStartRef.current = Date.now();
     const excludeIds = [...new Set([...(opts.excludeIds || []), ...seenIdsRef.current])];
@@ -101,6 +103,7 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
         body: JSON.stringify({
           node_id: Number(nodeId),
           difficulty: diff ?? difficulty,
+          ...(opts.type ? { type: opts.type } : {}),
           ...(opts.fresh || excludeIds.length ? { force_new: true, exclude_ids: excludeIds } : {}),
         }),
       });
@@ -116,12 +119,15 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
   };
 
   const submitAnswer = async () => {
-    if (!selected || !question || phase !== 'ready') return;
+    if (!question || phase !== 'ready') return;
+    const isOrder = question.type === 'order';
+    const answerPayload = isOrder ? JSON.stringify(orderDraft) : selected;
+    if (!answerPayload || (isOrder && orderDraft.length !== (question.options || []).length)) return;
     setPhase('judging');
     try {
       const data = await api('/api/attempts', {
         method: 'POST',
-        body: JSON.stringify({ question_id: question.id, answer: selected, duration_ms: Date.now() - askStartRef.current, error_tags: errorTags }),
+        body: JSON.stringify({ question_id: question.id, answer: answerPayload, duration_ms: Date.now() - askStartRef.current, error_tags: errorTags }),
       });
       setResult(data);
       setPhase('done');
@@ -202,23 +208,62 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
       <div className="card enter-d1">
         {phase === 'asking' && (
           <div className="center" style={{ padding: '36px 10px' }}>
-            <div className="pulse-ring" style={{ width: 56, height: 56, borderRadius: '50%', margin: '0 auto 14px', background: 'var(--grad-soft)', display: 'grid', placeItems: 'center', fontSize: '1.6em' }}>🧠</div>
+            <div className="pulse-ring" style={{ width: 56, height: 56, borderRadius: '50%', margin: '0 auto 14px', background: 'var(--grad-soft)', display: 'grid', placeItems: 'center', fontSize: '1.6em' }}>
+              <span className="think-orb">🧠</span>
+            </div>
             <p>小问正在打草稿<span className="dots"></span></p>
-            <p className="muted small">前半程屏幕不动是在构思，不是卡住</p>
+            <div className="column" style={{ display: 'flex', flexDirection: 'column', gap: 8, width: 'min(100%, 260px)', margin: '16px auto 0' }}>
+              <div className="skeleton" style={{ height: 14, width: '90%' }} />
+              <div className="skeleton" style={{ height: 14, width: '70%' }} />
+              <div className="skeleton" style={{ height: 14, width: '82%' }} />
+            </div>
+            <p className="muted small mt12">前半程屏幕不动是在构思，不是卡住</p>
           </div>
         )}
 
         {phase !== 'asking' && question && (
           <>
             <div className="row between mb12">
-              <span className="chip" style={{ background: 'var(--grad-soft)' }}>{question.type === 'judge' ? '判断题' : '单选题'} · 难度 {question.difficulty}</span>
+              <span className="chip" style={{ background: 'var(--grad-soft)' }}>{question.type === 'order' ? '排序题' : question.type === 'judge' ? '判断题' : '单选题'} · 难度 {question.difficulty}</span>
               <span className="muted small">知识点 #{question.node_id}</span>
             </div>
             <Highlightable text={question.stem} highlights={hlFor('stem', question.stem)} meta={hlMeta('stem')} onAdded={onHlAdded}
               className="hl-stem" style={{ fontSize: '1.1em', lineHeight: 1.6, marginBottom: 14 }} />
 
             {/* 作答区 */}
-            {phase === 'ready' && (
+            {phase === 'ready' && question.type === 'order' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <p className="small muted">按正确顺序依次点击，点错了可以撤回重排</p>
+                <div className="order-slots">
+                  {orderDraft.length === 0 && <span className="muted small">你的顺序：（还没选）</span>}
+                  {orderDraft.map((s, i) => (
+                    <button key={i} className="order-slot" title="点击撤回"
+                      onClick={() => setOrderDraft(orderDraft.filter((_, j) => j !== i))}>
+                      <span className="key">{i + 1}</span><span className="grow">{s}</span><span className="muted">✕</span>
+                    </button>
+                  ))}
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {(question.options || []).map((opt, i) => {
+                    const used = orderDraft.includes(String(opt));
+                    return (
+                      <button key={i} className={`option ${used ? 'selected' : ''}`} disabled={used}
+                        onClick={() => setOrderDraft([...orderDraft, String(opt)])}>
+                        <span className="key">{String.fromCharCode(65 + i)}</span>
+                        <span className="grow">{opt}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+                <div className="row" style={{ gap: 8 }}>
+                  {orderDraft.length > 0 && <button className="btn sm" onClick={() => setOrderDraft([])}>清空重排</button>}
+                  {orderDraft.length === (question.options || []).length && (
+                    <button className="btn primary grow" onClick={submitAnswer}>提交作答</button>
+                  )}
+                </div>
+              </div>
+            )}
+            {phase === 'ready' && question.type !== 'order' && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                 {(Array.isArray(question.options) ? question.options : []).map((opt, i) => (
                   <button key={i} className={`option ${selected === String(opt) ? 'selected' : ''}`}
@@ -237,23 +282,47 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
             {phase === 'judging' && (
               <p className="center muted" style={{ padding: 24 }}>正在批改并写讲解<span className="dots"></span></p>
             )}
-            {/* 提交完成后才亮出对错 */}
-            {phase === 'done' && result && (
-              <div className="enter" style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 14 }}>
-                {(Array.isArray(question.options) ? question.options : []).map((opt, i) => (
-                  <div key={i} className={`option ${i === result.correct_index ? 'correct' : ''} ${selected === String(opt) && i !== result.correct_index ? 'wrong' : ''}`}>
-                    <span className="key">{String.fromCharCode(65 + i)}</span>
-                    <span className="grow">{opt}</span>
-                    {i === result.correct_index && <span className="small" style={{ color: 'var(--ok)' }}>正确答案</span>}
-                    {selected === String(opt) && i !== result.correct_index && <span className="small" style={{ color: 'var(--err)' }}>你的选择</span>}
+            {/* 排序题：提交后才揭晓正确顺序，并逐个标出用户放错的位置 */}
+            {phase === 'done' && result && question.type === 'order' && (
+              <div className="enter" style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 14 }}>
+                <p className="small" style={{ fontWeight: 600 }}>正确顺序（点击撤回仅用于作答阶段）</p>
+                {(result.correct_order || []).map((s, i) => (
+                  <div key={i} className={`option ${orderDraft[i] === s ? 'correct' : 'wrong'}`}>
+                    <span className="key">{i + 1}</span>
+                    <span className="grow">{s}</span>
+                    <span className="small muted">{orderDraft[i] === s ? '位置正确' : `你放了：${orderDraft[i] || '（空）'}`}</span>
                   </div>
                 ))}
               </div>
             )}
+            {/* 提交完成后才亮出对错 */}
+            {phase === 'done' && result && question.type !== 'order' && (
+              <div className="enter" style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 14 }}>
+                {(Array.isArray(question.options) ? question.options : []).map((opt, i) => {
+                  const isCorrect = i === result.correct_index;
+                  const isWrongPick = selected === String(opt) && !isCorrect;
+                  return (
+                    <div key={i} className={`option opt-reveal ${isCorrect ? 'correct' : ''} ${isWrongPick ? 'wrong' : ''}`}
+                      style={{ animationDelay: `${0.05 + i * 0.06}s` }}>
+                      <span className="key">{isCorrect ? (
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path className="check-draw" d="M5 12l5 5L20 7" /></svg>
+                      ) : String.fromCharCode(65 + i)}</span>
+                      <span className="grow">{opt}</span>
+                      {isCorrect && <span className="small" style={{ color: 'var(--ok)' }}>正确答案</span>}
+                      {isWrongPick && <span className="small" style={{ color: 'var(--err)' }}>你的选择</span>}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
             {phase === 'done' && result && (
               <div className={result.is_correct ? 'result-ok' : 'result-bad'}>
-                <div className="row mb12" style={{ gap: 10 }}>
-                  <span style={{ fontSize: '2em' }}>{result.is_correct ? '🎉' : '💡'}</span>
+                <div className="row mb12" style={{ gap: 12 }}>
+                  <span className={`verdict-badge ${result.is_correct ? 'ok' : 'bad'}`}>
+                    {result.is_correct ? (
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path className="check-draw" d="M5 12l5 5L20 7" /></svg>
+                    ) : <span style={{ fontSize: '1.2em' }}>💡</span>}
+                  </span>
                   <div>
                     <strong>{result.is_correct ? '答对了，这个点稳了' : '答错了，别灰心'}</strong>
                     <div className="muted small">当前掌握度 {Math.round(result.mastery * 100)}%</div>
@@ -324,10 +393,11 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
 
             {/* 快捷操作 */}
             {phase === 'done' && (
-              <div className="row mt12" style={{ gap: 8 }}>
+              <div className="row mt12" style={{ gap: 8, flexWrap: 'wrap' }}>
                 <button className="btn sm grow" onClick={nextSimilar}>出个类似的</button>
                 <button className="btn sm grow" onClick={nextNew}>同层换新</button>
                 <button className="btn sm grow" onClick={skip}>换个方向</button>
+                <button className="btn sm grow" onClick={() => ask(question.node_id, difficulty, { type: 'order', fresh: true })}>出排序题</button>
               </div>
             )}
           </>

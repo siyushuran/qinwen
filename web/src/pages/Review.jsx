@@ -18,7 +18,10 @@ export default function Review() {
   return (
     <>
       <div className="card enter pulse-ring">
-        <h2>🔁 今日复习</h2>
+        <div className="row between">
+          <h2>🔁 今日复习</h2>
+          <button className="btn ghost sm" onClick={() => navigate('/palace')}>🏛️ 记忆宫殿</button>
+        </div>
         {loading ? (
           <p className="muted">正在查看到期清单<span className="dots"></span></p>
         ) : due.length === 0 ? (

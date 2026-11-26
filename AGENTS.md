@@ -10,11 +10,16 @@
 ## 架构
 - 单进程 Node：API + SSE + OpenAI 兼容模型抽象 + SQLite 单文件 + 静态托管 `web/dist`
 - 数据：`server/data/qingwen.db`（WAL）；`material`/`material_chunk` 存文章快照与切块；`question`/`chat_turn`/`highlight` 带 `material_id`，题目与划线另有 `chunk_id`
-- 资料流：粘贴 Markdown → 标题切块（约 1200 字）→ 摘要/清单/出题/SSE 问答；中文双字词 + 英文词关键词召回，不引向量库；回答强制带引用编号，争议按「文章称」
+- 资料流：粘贴 Markdown 或图片 data URL → 标题切块（约 1200 字）→ 摘要/清单/出题/SSE 问答；中文双字词 + 英文词关键词召回，不引向量库；回答强制带引用编号，争议按「文章称」
+- 记忆卡：`memory_card` 按 node_id 唯一缓存「房间/意象/线索/答案」，自评写回 `review_slot`；交叉核验不建表，只做跨资料召回 + 逐条引用校验
+- 排序题：`type='order'`，answer 与提交值均为选项原文的 JSON 有序数组；前端点选排序，顺序全对才算对
 - 题库导入幂等靠 `source_key` 前缀，默认 `munger-kb://`；其他来源显式传 `domain_name`/`domain_key`/`source_key_prefix`/`domain_source`
 
 ## Things That Will Bite You
 - `/api/chat` 只接受 `question_id`；资料问答必须走 `POST /api/materials/:id/chat`
+- 排序题的 answer 不能塞进 `answerIndex()`；缓存题按 type 分流，避免「出排序题」拿到旧单选题
+- 交叉核验的 `quote` 必须逐字命中召回片段、`material_id/idx` 必须来自真实片段，否则整条丢弃；`article_claim` 自动加「文章称」
+- 图片只收 data URL（PNG/JPEG/WebP/GIF、3MB 内），原图存 `DATA_DIR/uploads/` 经 `/uploads/<hash>.<ext>` 托管；模型不支持 vision 时明确报 502，不编造描述
 - 出题接口不下发 `answer`/`explanation`，提交作答后才返回 `correct_index`
 - 可选整数查询参数不要用带默认值的 `intIn()` 钳制（曾把缺失的 `domain_id` 钳成 1，划线全被过滤）
 - 模型 Base URL 仅公网 HTTPS（回环 HTTP 例外），拒绝内网/元数据地址与跳转；API Key 不写进代码、文档或输出

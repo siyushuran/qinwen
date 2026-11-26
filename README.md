@@ -16,6 +16,9 @@
 
 - 单用户访问密码（scrypt 哈希存储，Bearer Token 鉴权）
 - 资料库（M4）：粘贴文章/Markdown → 按标题切块 → 生成摘要、按资料拆清单、接地问答、资料出题
+- 记忆宫殿复习卡：一间房 + 一条意象 + 一条自测线索，先回忆后揭示，自评直接驱动间隔复习
+- 多文档交叉核验：跨资料召回同一主张的原文，逐条标注支持/矛盾/无关；伪引用会被丢弃
+- 排序题与图片资料：选项点选排序（答案有序、顺序错即判错）；上传截图由视觉模型转成可检索资料
 - 创建领域 → AI 拆知识清单（构建过程拟人化可视化，清单可增删）
 - 出题（单选/判断，落库缓存复用，下发数据不含答案）→ 提交作答后才判分并高亮对错 + AI 讲解
 - 错因标签（概念不清/计算失误/审题偏差/纯手滑），作答后补记并保存，错题本可按错因筛选
@@ -38,10 +41,10 @@
 ```
 qingwen-practice/
 ├── server/server.mjs           # 后端（零依赖，Node 24 内置 node:sqlite）
-├── server/*-test.mjs           # 端到端测试（临时库 + 模拟模型）
+├── server/*-test.mjs           # 端到端测试（含 phase2-test.mjs，临时库 + 模拟模型）
 ├── server/seed-article.mjs     # 一次性资料导入脚本
 ├── web/                        # 前端源码（Vite + React）
-│   ├── src/pages/              # 含 Materials.jsx / MaterialDetail.jsx
+│   ├── src/pages/              # 含 Materials.jsx / MaterialDetail.jsx / Palace.jsx
 │   ├── public/                 # manifest / icon
 │   └── dist/                   # 构建产物（部署用，随仓库提交）
 ├── docker-compose.yml          # NAS 部署配置
@@ -72,6 +75,7 @@ node server/smoke-test.mjs          # 主流程与关键边界
 node server/bank-import-test.mjs    # 题库导入幂等与出题
 node server/material-test.mjs       # 资料入库/摘要/清单/出题/问答/划线
 node server/highlight-test.mjs      # 划线增删改查/搜索/导出
+node server/phase2-test.mjs         # 排序题/记忆卡/交叉核验/图片资料
 
 # 部署后静态资源/健康检查验证
 node verify.js <目标地址> <web/dist路径> <结果输出路径>
@@ -104,7 +108,7 @@ node verify.js <目标地址> <web/dist路径> <结果输出路径>
 - 模型地址：只允许公网 HTTPS；本地 Ollama 等回环 HTTP 例外；拒绝内网/链路本地/云元数据地址，禁止跟随跳转，避免 API Key 被带往任意地址。日志与错误响应不回显上游响应体。
 - 数据导出：使用 `VACUUM INTO` 生成一致性快照（WAL 下直接拷贝主库可能是空文件），删除令牌、密码哈希、模型密钥后再 `VACUUM` 重建页面，避免明文残留在空闲页；恢复后需重新设置密码与模型配置。
 - 写入可靠性：作答、出题、清单重建、删除均使用 SQLite 事务；同一知识点的出题串行化，避免并发产生重复题或丢失掌握度更新。
-- 限流：登录 8 次/10 分钟、初始化 5 次/10 分钟、出题 40 次/分钟（「出下一题」12 次/分钟）、作答 60 次/分钟、拆解 5 次/分钟、追问 20 次/分钟（最多 2 路并发）、导出 5 次/分钟；资料入库/摘要/出题各 10 次/分钟、资料问答 20 次/分钟；模型调用全局最多 2 并发，单知识点题目上限 200 道。
+- 限流：登录 8 次/10 分钟、初始化 5 次/10 分钟、出题 40 次/分钟（「出下一题」12 次/分钟）、作答 60 次/分钟、拆解 5 次/分钟、追问 20 次/分钟（最多 2 路并发）、导出 5 次/分钟；资料入库/摘要/出题/图片转写/核验/卡片生成各 10 次/分钟、资料问答与卡片自评各 20 次/分钟；模型调用全局最多 2 并发，单知识点题目上限 200 道。
 
 ## 外部题库：芒格思维模型（munger-kb）
 
@@ -156,6 +160,8 @@ API（均需 Bearer Token）：
 |---|---|---|
 | GET | `/api/materials` | 资料列表（含切块数与关联领域） |
 | POST | `/api/materials` | 入库并切块，body `{title, content, source_url, domain_id, claim_policy}` |
+| POST | `/api/materials/image` | 图片 data URL → 视觉模型转写为资料，body `{image, title, hint, domain_id}`；原图落在 `server/data/uploads/` |
+| POST | `/api/materials/verify` | 跨资料交叉核验，body `{claim, material_ids?}`；引用必须逐字命中原文 |
 | GET | `/api/materials/:id` | 资料详情与全部分块 |
 | DELETE | `/api/materials/:id` | 删除资料与分块（保留已生成题目） |
 | POST | `/api/materials/:id/summary` | 生成/读取摘要（缓存） |
@@ -164,6 +170,8 @@ API（均需 Bearer Token）：
 | POST | `/api/materials/:id/chat` | 资料问答（SSE，首帧为引用来源） |
 
 题库导入已通用化：`POST /api/bank/import` 可选传 `domain_name`、`domain_key`、`source_key_prefix`、`domain_source`，缺省仍为 `munger-kb`，不影响既有芒格题库。`GET /api/bank/stats?prefix=...&domain_key=...` 可按前缀查看统计。
+
+排序题：`POST /api/questions` 传 `{type:'order'}`、`POST /api/materials/:id/questions` 传 `{type:'order'}` 即生成排序题。`answer` 是有序的选项原文数组（库内存 JSON 字符串），提交时传同样的 JSON 数组；顺序完全一致才判对，返回 `correct_order` 与 `first_wrong`。题库导入仍只接受单选/判断，不会污染既有 1290 题。
 
 一次性导入文章（需要网站登录 token）：
 
@@ -174,6 +182,22 @@ QW_TOKEN='<网站token>' node server/seed-article.mjs https://qw.icge.top:1487 .
 令牌也可从只读数据库副本读取，避免在命令行暴露：`QW_DB=/path/to/qingwen.db node server/seed-article.mjs ...`。`SEED_RESULT_FILE=<路径>` 可把非敏感导入结果写入文件供容器外验证，验证后必须删除。
 
 验证：`node server/material-test.mjs`（临时库 + 模拟模型，覆盖入库/摘要/清单/出题/问答/划线/通用导入）。
+
+## 记忆宫殿与交叉核验
+
+记忆宫殿卡把知识点放进一间具体的「房间」，用意象做位置线索，先看 `cue` 自测、再揭示 `answer`。卡片生成结果按知识点缓存（一个知识点一张），自评「记住/没记住」与作答走同一套 `review_slot` 调度。资料未覆盖时卡片只基于知识点名称生成，不伪装成原文依据。
+
+交叉核验先对每篇资料按主张做关键词召回，再让模型判断支持/矛盾/无关。服务端强制校验 `material_id` / `idx` 必须来自真实召回片段、`quote` 必须是片段中的逐字原文，否则丢弃该条；口径为 `article_claim` 的结论自动加「文章称」。
+
+API（均需 Bearer Token）：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/memory-cards` | 卡片列表（含到期时间与来源知识点） |
+| POST | `/api/memory-cards/generate` | 生成卡片，body `{node_id?, material_id?, count?}`；不传则从到期知识点生成 |
+| POST | `/api/memory-cards/:id/review` | 自评，body `{remembered: true/false}`，返回下次到期时间 |
+
+前端入口：复习页「🏛️ 记忆宫殿」，资料详情页「生成记忆卡」；资料页「🖼️ 图片转资料」与「🔍 多文档交叉核验」。
 
 ## 划线收藏
 
