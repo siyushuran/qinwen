@@ -5,6 +5,13 @@ import Highlightable from '../components/Highlightable.jsx';
 
 const ERROR_TAGS = ['概念不清', '计算失误', '审题偏差', '纯手滑'];
 const DIFF_LABEL = { 1: '入门', 2: '基础', 3: '进阶', 4: '挑战', 5: '硬核' };
+const DIFF_DESC = {
+  1: '识记·辨认即可',
+  2: '理解·辨析概念',
+  3: '应用·具体场景',
+  4: '分析·多步推理',
+  5: '综合·反例迁移',
+};
 
 export default function Learn({ domainId, focusNode, focusQuestion }) {
   const [domain, setDomain] = useState(null);
@@ -117,6 +124,7 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
           node_id: Number(nodeId),
           difficulty: diff ?? difficulty,
           ...(opts.type ? { type: opts.type } : {}),
+          ...(opts.regenerate ? { regenerate: true } : {}),
           ...(opts.fresh || excludeIds.length ? { force_new: true, exclude_ids: excludeIds } : {}),
         }),
       });
@@ -182,8 +190,8 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
   const chooseDifficulty = (d) => {
     if (d === difficulty) return;
     setDifficulty(d);
-    // 正在做题时立即按新难度换题；idle 状态只记下选择，下次出题生效
-    if (question && phase !== 'asking') ask(question.node_id, d, { fresh: true });
+    // 正在做题时立即按新难度重新生成，跳过旧难度缓存；idle 状态只记下选择
+    if (question && phase !== 'asking') ask(question.node_id, d, { fresh: true, regenerate: true });
   };
   const nextQuestion = () => {
     if (!question || nodes.length === 0) return;
@@ -225,10 +233,10 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
           {[1, 2, 3, 4, 5].map(d => (
             <button key={d} className={`chip ${difficulty === d ? 'on' : ''}`}
               style={{ padding: '4px 12px', fontSize: '.82em' }}
-              title={`${d} 档 · ${DIFF_LABEL[d]}`}
+              title={`${d} 档 · ${DIFF_LABEL[d]}：${DIFF_DESC[d]}`}
               onClick={() => chooseDifficulty(d)}>{d}</button>
           ))}
-          <span className="muted small">{DIFF_LABEL[difficulty]}</span>
+          <span className="muted small">{DIFF_LABEL[difficulty]} · {DIFF_DESC[difficulty]}</span>
         </div>
       </div>
 

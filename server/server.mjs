@@ -303,12 +303,26 @@ function promptBuildList(domainName, levelDesc) {
 要求：3~5 个知识面，每个知识面 3~6 个知识点，知识点要具体、可出题、贴合兴趣学习场景。`;
 }
 
+// 难度阶梯：把「1~5 档」翻译成模型可执行的差异维度，不能只写一个数字
+function difficultySpec(d) {
+  const specs = {
+    1: '【1档·识记】直接考定义、事实或术语对应；题干把关键条件说清楚，选项彼此差异明显，不需要推理，辨认即可选出。',
+    2: '【2档·理解】考概念辨析与解释；题干换一种说法或给一个简短情境，选项中要有 1~2 个相似但含义不同的干扰项，真懂才能区分。',
+    3: '【3档·应用】考迁移使用；题干给一个具体场景或案例，需要把知识点用起来（判断、计算、选择方案、预测结果），干扰项贴近常见误区。',
+    4: '【4档·分析】考多步推理与边界；题干含复合条件或需要拆解因果/结构，选项含强干扰项（似是而非、只对一半），必须排除与权衡。',
+    5: '【5档·综合】考跨域迁移与反例；题干给新颖或相反情境，需综合多个条件、识别隐含前提或反例，选项差异细微，必须深入推敲。',
+  };
+  return specs[d] || specs[1];
+}
+
 function promptMakeQuestion(nodeName, level, difficulty, interests, avoidStems = []) {
   const scene = interests ? `，尽量融入这些兴趣场景：${interests}` : '';
   const avoid = avoidStems.length
     ? `\n避免与这些已出过的题目重复（换角度、换情境、换问法）：\n${avoidStems.map((s, i) => `${i + 1}. ${s}`).join('\n')}`
     : '';
-  return `你是一位出题老师。请围绕知识点「${nodeName}」（认知层级 ${level}，难度档 ${difficulty}/5）出一道题${scene}。${avoid}
+  return `你是一位出题老师。请围绕知识点「${nodeName}」（认知层级 ${level}）出一道题${scene}。${avoid}
+难度要求：${difficultySpec(difficulty)}
+必须严格按该档位出题：不同档位在情境复杂度、推理步数与干扰项强度上要有明显差别，不得只是把题干换个说法。认知层级是知识点本身的属性，难度档由上面的要求决定。
 输出严格 JSON（不要 markdown）：
 {"type":"single","stem":"题干","options":["选项A","选项B","选项C","选项D"],"answer":"A","explanation":"解析，简洁讲清为什么"}
 type 只在 "single"（单选）和 "judge"（判断）中选；judge 时 options 为 ["正确","错误"]，answer 为 "正确" 或 "错误"。题干自然、生活化、无应试感。`;
@@ -430,7 +444,9 @@ ${src.slice(0, 20000)}`;
 }
 function promptMaterialQuestion(nodeName, level, difficulty, chunks, interests) {
   const picked = chunks.slice(0, 6).map(c => `[${c.idx}] ${c.heading}\n${c.content.slice(0, 900)}`).join('\n\n');
-  return `你是一位出题老师。请只根据资料，围绕知识点「${nodeName}」（认知层级 ${level}，难度 ${difficulty}/5）出一道题${interests ? `，尽量融入：${interests}` : ''}。
+  return `你是一位出题老师。请只根据资料，围绕知识点「${nodeName}」（认知层级 ${level}）出一道题${interests ? `，尽量融入：${interests}` : ''}。
+难度要求：${difficultySpec(difficulty)}
+严格按该档位出题，不同档位在情境复杂度、推理步数与干扰项强度上要有明显差别。
 输出严格 JSON（不要 markdown）：
 {"type":"single","stem":"题干","options":["选项A","选项B","选项C","选项D"],"answer":"选项原文","explanation":"解析，必须引用资料编号如[2]，简洁","chunk_index":资料编号整数}
 type 只能 single 或 judge；judge 时 options 为 ["正确","错误"]，answer 为 "正确" 或 "错误"；answer 必须是某个选项原文；题干自然、无应试感；涉及争议主张必须写"根据文章"。
@@ -460,7 +476,9 @@ ${src.slice(0, 22000)}`;
 // 排序题：顺序是要考的关系知识，answer 与 options 必须同源，options 故意打乱
 function promptMakeOrderQuestion(nodeName, level, difficulty, interests, chunks = []) {
   const src = chunks.slice(0, 5).map(c => `[${c.idx}] ${c.heading}\n${c.content.slice(0, 700)}`).join('\n\n');
-  return `你是一位出题老师。请围绕知识点「${nodeName}」（认知层级 ${level}，难度 ${difficulty}/5）出一道排序题${interests ? `，尽量融入：${interests}` : ''}${src ? '，且只依据下面的资料片段' : ''}。
+  return `你是一位出题老师。请围绕知识点「${nodeName}」（认知层级 ${level}）出一道排序题${interests ? `，尽量融入：${interests}` : ''}${src ? '，且只依据下面的资料片段' : ''}。
+难度要求：${difficultySpec(difficulty)}
+严格按该档位决定步骤数量、因果链长度与干扰强度：低档步骤少且顺序直白，高档步骤多、有分支或需要先判断再排序。
 输出严格 JSON（不要 markdown）：
 {"type":"order","stem":"请把下列步骤按正确顺序排列","options":["乱序步骤C","乱序步骤A","乱序步骤B"],"answer":["正确步骤A","正确步骤B","正确步骤C"],"explanation":"解析，${src ? '必须引用资料编号如[2]，' : ''}简洁"}
 要求：3~6 个步骤；answer 是正确顺序的选项原文数组；options 与 answer 必须是同一组步骤但顺序打乱；每一步 5~80 字；不得有重复步骤；涉及争议主张必须写"根据文章"。
@@ -1035,7 +1053,9 @@ routes['POST /api/questions'] = async (req, res) => {
   if (!node) return json(res, 404, { error: '知识点不存在' });
   const difficulty = intIn(b.difficulty, 1, 5, 1);
   const forceNew = b.force_new === true || b.force_new === 'true';
-  limitOrThrow(req, forceNew ? 'question-new' : 'question', forceNew ? 12 : 40, 60 * 1000);
+  // 手动切难度时跳过旧缓存，确保按新难度标准重新出题
+  const regenerate = b.regenerate === true || b.regenerate === 'true';
+  limitOrThrow(req, forceNew || regenerate ? 'question-new' : 'question', forceNew || regenerate ? 12 : 40, 60 * 1000);
   const excludeIds = (Array.isArray(b.exclude_ids) ? b.exclude_ids : [])
     .map(Number).filter(n => Number.isInteger(n) && n > 0).slice(0, 20);
   await withNodeLock(node.id, async () => {
@@ -1044,7 +1064,7 @@ routes['POST /api/questions'] = async (req, res) => {
     // 排序题与普通题分开取缓存，避免点了「排序题」却拿到缓存里的单选题
     const cached = db.prepare('SELECT * FROM question WHERE node_id = ? AND difficulty = ? ORDER BY id').all(node.id, difficulty)
       .find(q => (wantOrder ? q.type === 'order' : q.type !== 'order') && !excludeIds.includes(q.id));
-    if (cached && (!forceNew || excludeIds.length > 0)) {
+    if (cached && !regenerate && (!forceNew || excludeIds.length > 0)) {
       transaction(() => saveProgress(node.domain_id, node.id, cached.id, difficulty));
       return json(res, 200, { question: publicQuestion(cached), cached: true });
     }
