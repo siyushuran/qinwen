@@ -26,6 +26,7 @@
 - NAS 用 fnOS profile `home`：`file upload` 第一参数是远端目录，覆盖必须 `--overwrite replace`（`rename` 会留 `_1` 副本）；Git Bash 传 `/vol2/...` 报 Unsupported path，改用 PowerShell 调 `fnos-cli.cmd`
 - 线上 DB 下载链接会被脱敏，拿不到文件；需要 token 时在 NAS 内起临时 node 容器挂载目录读取，用完删除容器与临时结果文件
 - 改库前先停容器并备份 `qingwen.db` + `-wal` + `-shm` 到 `backup/`；`web/dist` 文件名带哈希，替换后清掉旧 assets
+- 本机 `git push` 偶发 `schannel: failed to receive handshake`；改用 `git -c http.sslBackend=openssl push origin main` 可成功
 - `SEED_RESULT_FILE` 只写非敏感结果到静态目录供临时验证，验证后必须删除
 
 ## Don't
