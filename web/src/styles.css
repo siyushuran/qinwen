@@ -465,3 +465,30 @@ ul { list-style: none; }
 }
 .verify-result { background: var(--surface-2); border-radius: var(--radius); padding: 12px 14px; }
 .verify-item { border-top: 1px solid var(--line); padding-top: 10px; }
+
+/* ---------- 跨领域组题 ---------- */
+.cross-ribbon {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  background: var(--grad-soft); border: 1px solid rgba(99, 102, 241, .18);
+  border-radius: var(--radius-sm); padding: 8px 12px;
+  font-size: .82em; color: var(--ink-soft);
+}
+.cross-ribbon > span:first-child { color: var(--primary-deep); font-weight: 700; }
+.sheet-backdrop {
+  position: fixed; inset: 0; z-index: 100;
+  background: rgba(15, 23, 42, .42); backdrop-filter: blur(3px);
+  display: flex; align-items: flex-end; justify-content: center;
+}
+.sheet {
+  width: min(100%, 620px); max-height: 86vh; overflow-y: auto;
+  background: var(--surface); border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  box-shadow: 0 -12px 40px rgba(15, 23, 42, .18);
+  padding: 20px 18px calc(20px + env(safe-area-inset-bottom));
+  animation: sheet-up .24s var(--ease-out-back);
+}
+@keyframes sheet-up { from { transform: translateY(24px); opacity: .6; } to { transform: translateY(0); opacity: 1; } }
+@media (min-width: 720px) {
+  .sheet-backdrop { align-items: center; }
+  .sheet { border-radius: var(--radius-lg); max-height: 80vh; }
+}
+.cross-pick-list { max-height: 34vh; overflow-y: auto; margin-top: 8px; padding-right: 2px; }

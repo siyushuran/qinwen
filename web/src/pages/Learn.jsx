@@ -12,6 +12,9 @@ const DIFF_DESC = {
   4: '分析·多步推理',
   5: '综合·反例迁移',
 };
+const BRIDGE_LABEL = {
+  auto: '自动选桥', analogy: '结构类比', transfer: '方法迁移', contrast: '边界对照', counterexample: '反例检验',
+};
 
 export default function Learn({ domainId, focusNode, focusQuestion }) {
   const [domain, setDomain] = useState(null);
@@ -39,6 +42,14 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
   const seenIdsRef = useRef([]); // 本轮已见过的题目，「出下一题」用它避免重复
   const [highlights, setHighlights] = useState([]); // 当前题目的划线
   const hlRef = useRef([]); // 每次 ask 后刷新，避免闭包拿到旧值
+  // 跨领域组题：主节点记账，关联节点只进题干/解析
+  const [crossOpen, setCrossOpen] = useState(false);
+  const [crossCandidates, setCrossCandidates] = useState([]);
+  const [crossPrimary, setCrossPrimary] = useState(null);
+  const [crossSelected, setCrossSelected] = useState([]);
+  const [crossBridge, setCrossBridge] = useState('auto');
+  const [crossKw, setCrossKw] = useState('');
+  const [crossConfig, setCrossConfig] = useState(null);
 
   const loadHighlights = async () => {
     try {
@@ -51,11 +62,13 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
   const loadDomain = async () => {
     seenIdsRef.current = [];
     setSelected(null); setOrderDraft([]); setResult(null); setErrorTags([]); setFollowups([]); setChat([]); setTagsSaved(false);
+    setCrossConfig(null); setCrossOpen(false);
     try {
       const data = await api(`/api/domains/${domainId}`);
       const active = data.nodes.filter(n => n.status === 'active');
       setDomain(data.domain);
       setNodes(active);
+      loadCandidates(0); // 题目上的关联知识点名称直接用这份清单，不必等打开面板
 
       // 直达指定题目：错题本「重练这题」，加载时就亮出这道题而不是另出一道
       if (focusQuestion) {
@@ -111,6 +124,17 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
     }
   }, [phase, question?.id]);
 
+  const nodeNameOf = (id) => nodes.find(n => n.id === id)?.name
+    || crossCandidates.find(n => n.id === id)?.name || `#${id}`;
+  const groupedCandidates = useMemo(() => {
+    const kw = crossKw.trim().toLowerCase();
+    const rows = crossCandidates.filter(n => !kw
+      || `${n.name} ${n.domain_name} ${n.parent_name || ''}`.toLowerCase().includes(kw));
+    const byDomain = {};
+    for (const n of rows) (byDomain[n.domain_name] ||= []).push(n);
+    return Object.entries(byDomain);
+  }, [crossCandidates, crossKw]);
+
   // 按来源类型/文本筛选当前题的划线，供题干/讲解/追问各自高亮
   const hlFor = (source, text) => hlRef.current.filter(h =>
     h.question_id === question?.id && h.source === source && text && h.text && text.includes(h.text)
@@ -123,7 +147,28 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
   });
   const onHlAdded = (item) => { hlRef.current = [item, ...hlRef.current]; setHighlights(hlRef.current); };
 
+  const loadCandidates = async (primaryId) => {
+    try {
+      const r = await api(`/api/nodes/candidates?exclude_id=${primaryId || 0}`);
+      setCrossCandidates(r.nodes || []);
+    } catch (e) { toast(e.message, 'err'); }
+  };
+  const openCross = () => {
+    const pid = Number(crossPrimary || question?.node_id || nodes[0]?.id || 0);
+    if (!pid) return;
+    setCrossPrimary(pid);
+    setCrossSelected([]); setCrossKw(''); setCrossOpen(true);
+    loadCandidates(pid);
+  };
+  const crossOpts = () => crossConfig
+    ? { relatedNodeIds: crossConfig.ids, bridgeType: crossConfig.bridgeType }
+    : {};
+
   const ask = async (nodeId, diff = null, opts = {}) => {
+    const relIds = (opts.relatedNodeIds || []).map(Number).filter(n => n > 0).slice(0, 3);
+    setCrossConfig(relIds.length
+      ? { primaryId: Number(nodeId), ids: relIds, bridgeType: opts.bridgeType || 'auto' }
+      : null);
     cardHeightRef.current = questionCardRef.current?.offsetHeight || 0;
     setPhase('asking');
     setSelected(null); setOrderDraft([]); setResult(null); setErrorTags([]); setFollowups([]); setChat([]); setTagsSaved(false);
@@ -146,8 +191,9 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
           node_id: Number(nodeId),
           difficulty: useDiff,
           ...(opts.type ? { type: opts.type } : {}),
+          ...(relIds.length ? { related_node_ids: relIds, bridge_type: opts.bridgeType || 'auto' } : {}),
           ...(opts.regenerate ? { regenerate: true } : {}),
-          ...(opts.fresh || excludeIds.length ? { force_new: true, exclude_ids: excludeIds } : {}),
+          ...(opts.fresh || excludeIds.length || relIds.length ? { force_new: true, exclude_ids: excludeIds } : {}),
         }),
       });
       setQuestion(data.question);
@@ -262,6 +308,8 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
             <button className="btn ghost sm" onClick={() => navigate('/')}>← 领域</button>
             <strong>{domain.name}</strong>
           </div>
+          <button className="btn ghost sm" disabled={!nodes.length} title="让两个领域的知识互相充当情境与工具"
+            onClick={openCross}>🔗 跨领域</button>
           <button className="btn ghost sm" onClick={() => navigate(`/map/${domainId}`)}>知识地图</button>
         </div>
         <div className="row mt8" style={{ gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
@@ -308,10 +356,17 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
 
         {phase !== 'asking' && question && (
           <>
-            <div className="row between mb12">
+            <div className="row between mb12" style={{ gap: 8, flexWrap: 'wrap' }}>
               <span className="chip" style={{ background: 'var(--grad-soft)' }}>{question.type === 'order' ? '排序题' : question.type === 'judge' ? '判断题' : '单选题'} · 难度 {question.difficulty}</span>
-              <span className="muted small">知识点 #{question.node_id}</span>
+              <span className="muted small">{nodeNameOf(question.node_id)}</span>
             </div>
+            {(question.related_node_ids || []).length > 0 && (
+              <div className="cross-ribbon mb12">
+                <span>🔗 跨领域</span>
+                <span>{BRIDGE_LABEL[question.bridge_type] || '知识迁移'}</span>
+                <span className="grow">主：{nodeNameOf(question.node_id)} × 关联：{question.related_node_ids.map(nodeNameOf).join('、')}</span>
+              </div>
+            )}
             <Highlightable text={question.stem} highlights={hlFor('stem', question.stem)} meta={hlMeta('stem')} onAdded={onHlAdded}
               className="hl-stem" style={{ fontSize: '1.1em', lineHeight: 1.6, marginBottom: 14 }} />
 
@@ -415,6 +470,11 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
                 </div>
                 <Highlightable text={result.explanation || ''} highlights={hlFor('explanation', result.explanation)} meta={hlMeta('explanation')} onAdded={onHlAdded}
                   style={{ background: 'var(--surface-2)', borderRadius: 'var(--radius)', padding: '12px 14px', fontSize: '.94em', whiteSpace: 'pre-wrap' }} />
+                {question.bridge && (
+                  <div className="cross-ribbon mt12">
+                    <span>🌉 桥接点</span><span className="grow">{question.bridge}</span>
+                  </div>
+                )}
                 {!result.is_correct && (
                   <div className="mt12">
                     <p className="small mb8" style={{ fontWeight: 600 }}>错在哪里？（可多选，保存后错题本按错因归类）</p>
@@ -483,6 +543,10 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
                 <button className="btn sm grow" onClick={nextNew}>同层换新</button>
                 <button className="btn sm grow" onClick={skip}>换个方向</button>
                 <button className="btn sm grow" onClick={() => ask(question.node_id, difficulty, { type: 'order', fresh: true })}>出排序题</button>
+                <button className="btn sm grow" onClick={openCross}>🔗 跨领域组题</button>
+                {(question.related_node_ids || []).length > 0 && (
+                  <button className="btn sm grow" onClick={() => ask(question.node_id, difficulty, { ...crossOpts(), fresh: true, regenerate: true })}>🔁 同类迁移</button>
+                )}
               </div>
             )}
           </>
@@ -504,6 +568,65 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
         </div>
       )}
       <p className="muted small center" style={{ textAlign: 'center' }}>内容由 AI 生成，仅供参考</p>
+
+      {crossOpen && (
+        <div className="sheet-backdrop" onClick={() => setCrossOpen(false)}>
+          <div className="sheet" onClick={e => e.stopPropagation()}>
+            <div className="row between mb12">
+              <strong>🔗 跨领域组题</strong>
+              <button className="btn ghost sm" onClick={() => setCrossOpen(false)}>关闭</button>
+            </div>
+            <p className="small muted mb12">不是把两个知识点并列。选一个主知识点当考查目标，再用另一个领域的知识点当情境、工具或反例，逼自己真的迁移一次。掌握度只记主知识点。</p>
+            <label className="small">主知识点（计入掌握度）</label>
+            <select className="select mt8" value={crossPrimary || ''} onChange={e => {
+              const p = Number(e.target.value);
+              setCrossPrimary(p); setCrossSelected([]); loadCandidates(p);
+            }}>
+              {nodes.map(n => <option key={n.id} value={n.id}>{n.name}</option>)}
+            </select>
+            <label className="small mt12">关联知识点（最多 3 个，只进题干与解析）</label>
+            <input className="input mt8" placeholder="搜索知识点、领域或知识面" value={crossKw}
+              onChange={e => setCrossKw(e.target.value)} />
+            <div className="cross-pick-list">
+              {groupedCandidates.map(([domainName, items]) => (
+                <div key={domainName} className="mb12">
+                  <p className="small muted mb8">{domainName}</p>
+                  <div className="chips">
+                    {items.map(n => {
+                      const on = crossSelected.includes(n.id);
+                      return (
+                        <button key={n.id} className={`chip ${on ? 'on' : ''}`}
+                          title={`${n.domain_name} · ${n.parent_name || '知识点'}`}
+                          onClick={() => setCrossSelected(on
+                            ? crossSelected.filter(id => id !== n.id)
+                            : [...crossSelected, n.id].slice(-3))}>
+                          {n.domain_id !== Number(domainId) ? '🌐 ' : ''}{n.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+              {!groupedCandidates.length && <p className="muted small">没有匹配的知识点</p>}
+            </div>
+            <label className="small mt12">桥接方式</label>
+            <div className="chips mt8">
+              {Object.entries(BRIDGE_LABEL).map(([k, label]) => (
+                <button key={k} className={`chip ${crossBridge === k ? 'on' : ''}`}
+                  onClick={() => setCrossBridge(k)}>{label}</button>
+              ))}
+            </div>
+            <button className="btn primary block mt12" disabled={!crossSelected.length}
+              onClick={() => {
+                const ids = crossSelected.slice(0, 3);
+                setCrossOpen(false);
+                ask(crossPrimary, difficulty, { relatedNodeIds: ids, bridgeType: crossBridge, fresh: true, regenerate: true });
+              }}>
+              生成跨领域题（{crossSelected.length} 个关联）
+            </button>
+          </div>
+        </div>
+      )}
     </>
   );
 }

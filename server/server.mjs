@@ -55,7 +55,10 @@ CREATE TABLE IF NOT EXISTS question (
   explanation TEXT,
   model TEXT,
   prompt_ver TEXT,
-  created_at TEXT
+  created_at TEXT,
+  related_node_ids TEXT DEFAULT '[]',
+  bridge_type TEXT DEFAULT '',
+  bridge TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS attempt (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,6 +166,10 @@ ensureColumn('question', 'source_url', "TEXT DEFAULT ''");
 ensureColumn('question', 'source_type', "TEXT DEFAULT ''");
 ensureColumn('question', 'material_id', 'INT');
 ensureColumn('question', 'chunk_id', 'INT');
+// 跨领域题：关联节点只参与题干与解析，掌握度/错题/复习仍只记主节点
+ensureColumn('question', 'related_node_ids', "TEXT DEFAULT '[]'");
+ensureColumn('question', 'bridge_type', "TEXT DEFAULT ''");
+ensureColumn('question', 'bridge', "TEXT DEFAULT ''");
 ensureColumn('chat_turn', 'material_id', 'INT');
 ensureColumn('chat_turn', 'source_chunk_ids', "TEXT DEFAULT '[]'");
 ensureColumn('highlight', 'material_id', 'INT');
@@ -325,6 +332,45 @@ function promptMakeQuestion(nodeName, level, difficulty, interests, avoidStems =
 必须严格按该档位出题：不同档位在情境复杂度、推理步数与干扰项强度上要有明显差别，不得只是把题干换个说法。认知层级是知识点本身的属性，难度档由上面的要求决定。
 输出严格 JSON（不要 markdown）：
 {"type":"single","stem":"题干","options":["选项A","选项B","选项C","选项D"],"answer":"A","explanation":"解析，简洁讲清为什么"}
+type 只在 "single"（单选）和 "judge"（判断）中选；judge 时 options 为 ["正确","错误"]，answer 为 "正确" 或 "错误"。题干自然、生活化、无应试感。`;
+}
+
+// 跨领域出题的桥接类型：把「结合两个知识点」翻译成四种可验证的迁移关系，
+// 而不是让模型自由发挥成"先讲A再讲B"的两张皮。
+const BRIDGE_TYPES = {
+  auto: '从下面四种里选最自然的一种',
+  analogy: '结构类比：两件事表面无关，但内部结构/约束同构，用熟悉的结构看懂陌生的结构',
+  transfer: '方法迁移：把一个领域的解题方法、判断框架搬到另一个领域使用',
+  contrast: '边界对照：两个知识点容易混淆，题眼是划清各自适用边界，判断何时用哪个',
+  counterexample: '反例检验：用另一个领域的情况推翻"看起来对"的推断，识别隐含前提',
+};
+function bridgeTypeOf(v) {
+  return Object.prototype.hasOwnProperty.call(BRIDGE_TYPES, v) ? v : 'auto';
+}
+
+function promptBridgeQuestion(primary, related, level, difficulty, interests, bridgeType, avoidStems = []) {
+  const relDesc = related.map((n, i) =>
+    `${i + 1}. 「${n.name}」${n.domain_name ? `（领域：${n.domain_name}）` : ''}（认知层级 ${n.cognitive_level || 1}）`).join('\n');
+  const scene = interests ? `，尽量融入这些兴趣场景：${interests}` : '';
+  const avoid = avoidStems.length
+    ? `\n避免与这些已出过的题重复（换角度、换情境、换问法）：\n${avoidStems.map((s, i) => `${i + 1}. ${s}`).join('\n')}`
+    : '';
+  return `你是一位擅长「知识迁移」的出题老师。请出一道真正把两个知识点焊在一起的题${scene}。${avoid}
+
+【主知识点（考查目标）】「${primary.name}」（认知层级 ${level}）
+【关联知识点（考场/工具）】
+${relDesc}
+【桥接方式】${BRIDGE_TYPES[bridgeType]}
+难度要求：${difficultySpec(difficulty)}
+
+硬性要求：
+- 关联知识点必须参与解题：它是情境、工具、类比对象或反例来源，不能只是并列出现；只靠主知识点或只靠关联知识点都应该答不对。
+- 题干里要写出能让学习者认出这两个知识点的线索，不得凭空编造具体数据、出处或实验结论。
+- 解析必须点明「桥」是什么：两者共享的结构或可迁移的方法，以及为什么不能只靠其中一个知识点作答。
+- 不同档位在情境复杂度、推理步数与干扰项强度上要有明显差别。
+
+输出严格 JSON（不要 markdown）：
+{"type":"single","stem":"题干","options":["选项A","选项B","选项C","选项D"],"answer":"A","explanation":"简洁解析，点明桥接关系","bridge":"一句话说清两个知识点的桥接点","bridge_type":"${bridgeType}"}
 type 只在 "single"（单选）和 "judge"（判断）中选；judge 时 options 为 ["正确","错误"]，answer 为 "正确" 或 "错误"。题干自然、生活化、无应试感。`;
 }
 
@@ -529,7 +575,21 @@ function normalizeQuestion(q) {
     try { options = JSON.parse(options); } catch { options = []; }
   }
   if (!Array.isArray(options)) options = [];
-  return { ...q, options };
+  let related = q.related_node_ids;
+  if (typeof related === 'string') {
+    try { related = JSON.parse(related); } catch { related = []; }
+  }
+  if (!Array.isArray(related)) related = [];
+  return { ...q, options, related_node_ids: related.filter(n => Number.isInteger(n) && n > 0) };
+}
+// 校验跨领域题是否真的提到关联知识点：模型可能只写"结合两者"却没有桥，
+// 这类题退化成普通题，必须挡在落库之前。中文双字词/英文词命中任一即可。
+function mentionsNode(body, name) {
+  const s = String(body || '').toLowerCase();
+  const n = String(name || '').trim().toLowerCase();
+  if (!n) return false;
+  if (s.includes(n)) return true;
+  return queryTokens(n).some(t => t.length >= 2 && s.includes(t));
 }
 // 排序题答案统一为「选项原文数组」：库中存 JSON 字符串，用户提交也是 JSON 字符串
 function parseOrderAnswer(raw) {
@@ -976,6 +1036,20 @@ routes['POST /api/domains/:id/build'] = async (req, res, m) => {
   json(res, 200, { ok: true, facets: cleaned, nodes });
 };
 
+// 跨领域出题候选：全领域 active 节点，带领域名与所属知识面，前端按领域分组选择
+routes['GET /api/nodes/candidates'] = (req, res) => {
+  if (!authed(req)) return json(res, 401, { error: '未登录' });
+  const params = new URL(req.url, 'http://localhost').searchParams;
+  const excludeId = intIn(params.get('exclude_id'), 1, 2147483647, 0);
+  const kw = text(params.get('q'), 40).toLowerCase();
+  const rows = db.prepare(`SELECT n.id, n.name, n.domain_id, n.parent_id, n.cognitive_level, n.mastery,
+      d.name AS domain_name, p.name AS parent_name
+    FROM node n JOIN domain d ON d.id = n.domain_id LEFT JOIN node p ON p.id = n.parent_id
+    WHERE n.status = 'active' AND (? = 0 OR n.id <> ?) ORDER BY d.id, n.id`).all(excludeId, excludeId);
+  const filtered = kw ? rows.filter(r => `${r.name} ${r.domain_name} ${r.parent_name || ''}`.toLowerCase().includes(kw)) : rows;
+  json(res, 200, { nodes: filtered.slice(0, 200) });
+};
+
 // 节点维护
 routes['POST /api/nodes'] = async (req, res) => {
   if (!authed(req)) return json(res, 401, { error: '未登录' });
@@ -1105,14 +1179,34 @@ routes['POST /api/questions'] = async (req, res) => {
   const forceNew = b.force_new === true || b.force_new === 'true';
   // 手动切难度时跳过旧缓存，确保按新难度标准重新出题
   const regenerate = b.regenerate === true || b.regenerate === 'true';
+  // 跨领域：关联节点只进入题干与解析；掌握度、错题、复习只记主节点，保证可归因
+  const rawRelated = Array.isArray(b.related_node_ids) ? b.related_node_ids : [];
+  const relatedIds = [...new Set(rawRelated.map(v => intIn(v, 1, 2147483647, 0)).filter(id => id > 0 && id !== node.id))]
+    .slice(0, 3).sort((x, y) => x - y);
+  let relatedNodes = [];
+  if (relatedIds.length) {
+    const ph = relatedIds.map(() => '?').join(',');
+    relatedNodes = db.prepare(`SELECT n.id, n.name, n.domain_id, n.cognitive_level, d.name AS domain_name
+      FROM node n JOIN domain d ON d.id = n.domain_id
+      WHERE n.id IN (${ph}) AND n.status = 'active'`).all(...relatedIds)
+      .sort((x, y) => relatedIds.indexOf(x.id) - relatedIds.indexOf(y.id));
+    if (relatedNodes.length !== relatedIds.length) return json(res, 400, { error: '关联知识点不可用' });
+  } else if (rawRelated.length) {
+    return json(res, 400, { error: '关联知识点不可用（不能与主知识点相同）' });
+  }
+  const bridgeType = relatedNodes.length ? bridgeTypeOf(b.bridge_type) : '';
+  if (b.type === 'order' && relatedNodes.length) return json(res, 400, { error: '排序题暂不支持跨领域组题' });
+  const relKey = JSON.stringify(relatedIds);
   limitOrThrow(req, forceNew || regenerate ? 'question-new' : 'question', forceNew || regenerate ? 12 : 40, 60 * 1000);
   const excludeIds = (Array.isArray(b.exclude_ids) ? b.exclude_ids : [])
     .map(Number).filter(n => Number.isInteger(n) && n > 0).slice(0, 20);
   await withNodeLock(node.id, async () => {
     const wantOrder = b.type === 'order';
     // 普通出题沿用缓存；「下一题」优先复用库中还没见过的题，避免重复调用模型
-    // 排序题与普通题分开取缓存，避免点了「排序题」却拿到缓存里的单选题
-    const cached = db.prepare('SELECT * FROM question WHERE node_id = ? AND difficulty = ? ORDER BY id').all(node.id, difficulty)
+    // 排序题、跨领域组合各自隔离缓存，避免点了「跨领域」却拿到普通题
+    const cached = db.prepare(`SELECT * FROM question WHERE node_id = ? AND difficulty = ?
+      AND COALESCE(related_node_ids, '[]') = ? AND COALESCE(bridge_type, '') = ? ORDER BY id`)
+      .all(node.id, difficulty, relKey, bridgeType)
       .find(q => (wantOrder ? q.type === 'order' : q.type !== 'order') && !excludeIds.includes(q.id));
     if (cached && !regenerate && (!forceNew || excludeIds.length > 0)) {
       transaction(() => saveProgress(node.domain_id, node.id, cached.id, difficulty));
@@ -1127,13 +1221,23 @@ routes['POST /api/questions'] = async (req, res) => {
       const avoidStems = placeholders
         ? db.prepare(`SELECT stem FROM question WHERE id IN (${placeholders})`).all(...excludeIds).map(r => r.stem).filter(Boolean).slice(0, 8)
         : [];
-      const prompt = wantOrder
-        ? promptMakeOrderQuestion(node.name, node.cognitive_level, difficulty, getSetting('interests') || '')
-        : promptMakeQuestion(node.name, node.cognitive_level, difficulty, getSetting('interests') || '', avoidStems);
+      const interests = getSetting('interests') || '';
+      const prompt = relatedNodes.length
+        ? promptBridgeQuestion({ name: node.name }, relatedNodes, node.cognitive_level, difficulty, interests, bridgeType, avoidStems)
+        : wantOrder
+          ? promptMakeOrderQuestion(node.name, node.cognitive_level, difficulty, interests)
+          : promptMakeQuestion(node.name, node.cognitive_level, difficulty, interests, avoidStems);
       const content = await llmChat([{ role: 'user', content: prompt }], { json: true });
       const q = JSON.parse(content);
       // 模型输出不可信：结构、数量、长度都要校验后再落库
       if (!q || typeof q !== 'object' || typeof q.stem !== 'string' || !q.stem.trim()) throw new Error('invalid question');
+      // 跨领域题必须说出「桥」是什么，且题干/解析/桥接说明里要真的出现关联知识点
+      const bridge = typeof q.bridge === 'string' ? q.bridge.trim().slice(0, 300) : '';
+      if (relatedNodes.length) {
+        if (bridge.length < 4) throw new Error('missing bridge');
+        const body = `${q.stem}\n${typeof q.explanation === 'string' ? q.explanation : ''}\n${bridge}`;
+        for (const rn of relatedNodes) if (!mentionsNode(body, rn.name)) throw new Error('bridge not grounded');
+      }
       let type, options, answer;
       if (wantOrder) {
         if (q.type !== 'order') throw new Error('not an order question');
@@ -1155,16 +1259,22 @@ routes['POST /api/questions'] = async (req, res) => {
         if (answerIndex(answer, options, true) < 0) throw new Error('answer not in options');
       }
       row = transaction(() => {
-        const r = db.prepare('INSERT INTO question (node_id, type, difficulty, stem, options, answer, explanation, model, prompt_ver, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        const ver = relatedNodes.length ? `${PROMPT_VER}-bridge-${bridgeType}` : wantOrder ? PROMPT_VER + '-order' : PROMPT_VER;
+        const r = db.prepare(`INSERT INTO question (node_id, type, difficulty, stem, options, answer, explanation,
+          model, prompt_ver, created_at, related_node_ids, bridge_type, bridge)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
           .run(node.id, type, difficulty, q.stem.slice(0, 1000), JSON.stringify(options), answer,
-            typeof q.explanation === 'string' ? q.explanation.slice(0, 4000) : '', llmConfig().chat_model, wantOrder ? PROMPT_VER + '-order' : PROMPT_VER, now());
+            typeof q.explanation === 'string' ? q.explanation.slice(0, 4000) : '', llmConfig().chat_model, ver, now(),
+            relKey, bridgeType, bridge);
         const inserted = db.prepare('SELECT * FROM question WHERE id = ?').get(r.lastInsertRowid);
         saveProgress(node.domain_id, node.id, inserted.id, difficulty);
         return inserted;
       });
     } catch (e) {
       if (e instanceof HttpError) throw e;
-      return json(res, 502, { error: '出题失败：模型输出不可用，请重试' });
+      return json(res, 502, { error: relatedNodes.length
+        ? '跨领域出题失败：题目没有形成真正的知识桥接，请重试'
+        : '出题失败：模型输出不可用，请重试' });
     }
     return json(res, 200, { question: publicQuestion(row), cached: false });
   });

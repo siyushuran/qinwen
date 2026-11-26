@@ -16,6 +16,7 @@
 - 题库导入幂等靠 `source_key` 前缀，默认 `munger-kb://`；其他来源显式传 `domain_name`/`domain_key`/`source_key_prefix`/`domain_source`
 - 自适应难度：`/api/difficulty/advice` 直接查 `attempt`+`question`，前 3 题定档、同档连对升/连错降、否则近 10 题正确率；前端 `qw_auto_difficulty` 控制自动，手动点档位会关闭
 - 学情：`/api/stats` 的 `weak_nodes` 按知识点聚合（≥2 次作答），`/api/review` 按逾期 + 薄弱度 + 近 7 天错次排序，均不新增表
+- 跨领域题：`question.related_node_ids`（JSON 数组）/`bridge_type`/`bridge`；缓存按主节点+难度+关联组合+桥接方式隔离；主节点独占记账，关联节点只进题干与解析
 
 ## Things That Will Bite You
 - `/api/chat` 只接受 `question_id`；资料问答必须走 `POST /api/materials/:id/chat`
@@ -24,6 +25,7 @@
 - 图片只收 data URL（PNG/JPEG/WebP/GIF、3MB 内），原图存 `DATA_DIR/uploads/` 经 `/uploads/<hash>.<ext>` 托管；模型不支持 vision 时明确报 502，不编造描述
 - 出题接口不下发 `answer`/`explanation`，提交作答后才返回 `correct_index`
 - 难度建议的连对/连错必须在**同一难度档**内累计，跨档不接续；`/api/review` 返回的是 `nd.*`，节点主键字段是 `id` 不是 `node_id`
+- 跨领域题必须校验题干/解析/桥接点真的提到关联知识点，否则模型会生成"两张皮"的伪迁移题；排序题不支持跨领域，返回 400
 - 可选整数查询参数不要用带默认值的 `intIn()` 钳制（曾把缺失的 `domain_id` 钳成 1，划线全被过滤）
 - 模型 Base URL 仅公网 HTTPS（回环 HTTP 例外），拒绝内网/元数据地址与跳转；API Key 不写进代码、文档或输出
 - NAS 用 fnOS profile `home`：`file upload` 第一参数是远端目录，覆盖必须 `--overwrite replace`（`rename` 会留 `_1` 副本）；Git Bash 传 `/vol2/...` 报 Unsupported path，改用 PowerShell 调 `fnos-cli.cmd`
