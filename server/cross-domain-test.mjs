@@ -127,7 +127,7 @@ async function run() {
     const advA = await call(`/api/difficulty/advice?node_id=${a.id}`);
     const advB = await call(`/api/difficulty/advice?node_id=${b.id}`);
     assert(advA.samples >= 1, '作答记到主知识点');
-    assert(advB.samples === 0, '关联知识点不记掌握度/复习');
+    assert(advB.node_samples === 0, '关联知识点自身没有作答记录（samples 可能来自领域累计）');
 
     badBridge = true;
     const fake = await post('/api/questions', {

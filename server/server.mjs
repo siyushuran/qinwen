@@ -859,7 +859,10 @@ async function withNodeLock(nodeId, fn) {
 const routes = {};
 
 // 健康检查
-routes['GET /api/health'] = (req, res) => json(res, 200, { ok: true, model_configured: modelAvailable(), time: now() });
+routes['GET /api/health'] = (req, res) => json(res, 200, {
+  ok: true, model_configured: modelAvailable(), time: now(),
+  build: '2026-11-27.2', advice_version: 2,
+});
 
 // 鉴权
 routes['POST /api/auth/setup'] = async (req, res) => {
@@ -1120,17 +1123,31 @@ routes['GET /api/questions/:id'] = (req, res, m) => {
 };
 
 // 出题（默认落库缓存复用；force_new 时跳过已见过的题，保证「下一题」是新题）
-// 自适应难度建议：只看这个知识点最近的真实作答，不引入新表。
-// 前 3 题用于定档；之后连对升档、连错降档，否则按近 10 题正确率微调。
+// 自适应难度建议：优先看这个知识点最近的真实作答；本知识点样本不足 3 题时，按同领域累计作答定档。
+// 否则主流程「出下一题」切到新知识点后，计数会从 1 重新开始，始终达不到升档所需题数。
+// 前 3 题用于定档；之后同档连对 2 题升档、连错 2 题降档，否则按同档近 10 题正确率微调。不引入新表。
 routes['GET /api/difficulty/advice'] = (req, res) => {
   if (!authed(req)) return json(res, 401, { error: '未登录' });
-  const nodeId = intIn(new URL(req.url, 'http://localhost').searchParams.get('node_id'), 1, 2147483647, 0);
+  const sp = new URL(req.url, 'http://localhost').searchParams;
+  const nodeId = intIn(sp.get('node_id'), 1, 2147483647, 0);
   if (!nodeId) return json(res, 400, { error: '缺少 node_id' });
-  if (!db.prepare('SELECT 1 FROM node WHERE id = ?').get(nodeId)) return json(res, 404, { error: '知识点不存在' });
-  const rows = db.prepare(`
+  const node = db.prepare('SELECT id, domain_id FROM node WHERE id = ?').get(nodeId);
+  if (!node) return json(res, 404, { error: '知识点不存在' });
+  const domainId = intIn(sp.get('domain_id'), 1, 2147483647, 0) || node.domain_id;
+  const nodeRows = db.prepare(`
     SELECT a.is_correct, a.created_at, q.difficulty
     FROM attempt a JOIN question q ON q.id = a.question_id
     WHERE a.node_id = ? ORDER BY a.created_at DESC, a.id DESC LIMIT 30`).all(nodeId);
+  let rows = nodeRows, scope = 'node';
+  if (nodeRows.length < 3) {
+    const domainRows = db.prepare(`
+      SELECT a.is_correct, a.created_at, q.difficulty
+      FROM attempt a JOIN question q ON q.id = a.question_id
+      JOIN node n ON n.id = a.node_id
+      WHERE n.domain_id = ? ORDER BY a.created_at DESC, a.id DESC LIMIT 30`).all(domainId);
+    // 哪怕领域也只答了 1~2 题，也按领域累计显示，避免切知识点后计数归零
+    if (domainRows.length > nodeRows.length) { rows = domainRows; scope = 'domain'; }
+  }
   const byDifficulty = {};
   for (const r of rows) {
     const d = intIn(r.difficulty, 1, 5, 1);
@@ -1141,7 +1158,7 @@ routes['GET /api/difficulty/advice'] = (req, res) => {
   if (rows.length === 0) {
     reason = '还没有作答记录，先用基础档试水';
   } else if (rows.length < 3) {
-    reason = `已答 ${rows.length} 题，答满 3 题后开始自动定档`;
+    reason = `已答 ${rows.length} 题${scope === 'domain' ? '（本领域累计）' : ''}，答满 3 题后开始自动定档`;
   } else {
     phase = 'adaptive';
     const lastDiff = intIn(rows[0].difficulty, 1, 5, 2);
@@ -1156,16 +1173,19 @@ routes['GET /api/difficulty/advice'] = (req, res) => {
       recommended = Math.max(1, Math.min(5, lastDiff + (lastCorrect ? 1 : -1)));
       reason = `同档连续 ${streak} 题${lastCorrect ? '答对' : '答错'}，${lastCorrect ? '升' : '降'}到 ${recommended} 档`;
     } else {
-      const recent = rows.slice(0, 10);
-      const rate = recent.filter(r => r.is_correct === 1).length / recent.length;
+      // 正确率只看当前档位：跨档混合统计会让刚升上来的第 1 题立刻又触发升档
+      const recent = rows.filter(r => intIn(r.difficulty, 1, 5, 0) === lastDiff).slice(0, 10);
+      const rate = recent.length ? recent.filter(r => r.is_correct === 1).length / recent.length : 0;
       const pct = Math.round(rate * 100);
-      if (rate >= 0.85 && lastDiff < 5) { recommended = lastDiff + 1; reason = `近 ${recent.length} 题正确率 ${pct}%，升到 ${recommended} 档`; }
-      else if (rate <= 0.4 && lastDiff > 1) { recommended = lastDiff - 1; reason = `近 ${recent.length} 题正确率 ${pct}%，降到 ${recommended} 档巩固`; }
-      else { recommended = lastDiff; reason = `近 ${recent.length} 题正确率 ${pct}%，保持 ${recommended} 档`; }
+      if (recent.length >= 2 && rate >= 0.85 && lastDiff < 5) { recommended = lastDiff + 1; reason = `${lastDiff} 档近 ${recent.length} 题正确率 ${pct}%，升到 ${recommended} 档`; }
+      else if (recent.length >= 2 && rate <= 0.4 && lastDiff > 1) { recommended = lastDiff - 1; reason = `${lastDiff} 档近 ${recent.length} 题正确率 ${pct}%，降到 ${recommended} 档巩固`; }
+      else { recommended = lastDiff; reason = `${lastDiff} 档近 ${recent.length} 题正确率 ${pct}%，保持 ${recommended} 档（同档连对 2 题升档）`; }
     }
   }
+  if (scope === 'domain' && phase === 'adaptive') reason = `领域累计定档：${reason}`;
   json(res, 200, {
-    ok: true, node_id: nodeId, recommended, reason, phase, samples: rows.length,
+    ok: true, node_id: nodeId, recommended, reason, phase, scope,
+    samples: rows.length, node_samples: nodeRows.length,
     by_difficulty: [1, 2, 3, 4, 5].map(d => ({ difficulty: d, ...(byDifficulty[d] || { n: 0, ok: 0 }) })),
   });
 };

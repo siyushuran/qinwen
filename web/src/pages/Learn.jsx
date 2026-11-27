@@ -35,6 +35,7 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
   const autoRef = useRef(autoDifficulty);
   autoRef.current = autoDifficulty;
   const [advice, setAdvice] = useState(null); // 该知识点的自适应难度建议
+  const adviceSeqRef = useRef(0); // 建议请求序号：答完与切知识点会各发一次，旧响应不能覆盖新建议
   const chatEndRef = useRef(null);
   const questionCardRef = useRef(null);
   const cardHeightRef = useRef(0); // 切题前卡片高度，出题动画期间占位，避免页面骤缩把滚动位置弹回顶部
@@ -106,9 +107,10 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
 
   const loadAdvice = async (nodeId) => {
     if (!nodeId) return null;
+    const seq = ++adviceSeqRef.current;
     try {
-      const r = await api(`/api/difficulty/advice?node_id=${nodeId}`);
-      setAdvice(r);
+      const r = await api(`/api/difficulty/advice?node_id=${nodeId}&domain_id=${domainId}`);
+      if (seq === adviceSeqRef.current) setAdvice(r); // 只让最后一次请求刷新建议条
       return r;
     } catch { return null; }
   };
@@ -256,10 +258,17 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
     );
   };
 
-  const chooseDifficulty = (d, keepAuto = false) => {
+  const chooseDifficulty = (d, fromAdvice = false) => {
     if (d === difficulty) return;
-    // 手动点档位即退出自动调档，避免下一次出题又跳回建议档；采纳系统建议时保持自动
-    if (autoRef.current && !keepAuto) {
+    if (fromAdvice) {
+      // 采纳建议即进入自动模式；否则只换这一题，下一题又按手动档走，看起来像建议没生效
+      if (!autoRef.current) {
+        setAutoDifficulty(true);
+        localStorage.setItem('qw_auto_difficulty', '1');
+        toast('已采纳建议并开启自动调档', 'ok');
+      }
+    } else if (autoRef.current) {
+      // 手动点档位即退出自动调档，避免下一次出题又跳回建议档
       setAutoDifficulty(false);
       localStorage.setItem('qw_auto_difficulty', '0');
       toast('已切到手动调档，点「自动」可恢复', '');
@@ -289,7 +298,7 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
   const nextNew = () => {
     const others = nodes.filter(n => n.id !== question.node_id);
     const target = others[Math.floor(Math.random() * others.length)] || nodes[0];
-    ask(target.id, difficulty);
+    ask(target.id, autoRef.current ? null : difficulty, { fresh: true });
   };
   const skip = () => {
     const others = nodes.filter(n => n.id !== question.node_id);
@@ -327,7 +336,7 @@ export default function Learn({ domainId, focusNode, focusQuestion }) {
         {advice && (
           <div className="row mt8" style={{ gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
             <span className="chip" style={{ background: 'var(--grad-soft)' }}>
-              {advice.phase === 'calibrating' ? '定档中' : '自适应'} · {advice.samples} 题样本
+              {advice.phase === 'calibrating' ? '定档中' : '自适应'} · {advice.scope === 'domain' ? '领域' : '本知识点'} {advice.samples} 题样本
             </span>
             <span className="muted small grow" style={{ minWidth: 120 }}>{advice.reason}</span>
             <button className="btn sm" disabled={advice.recommended === difficulty}

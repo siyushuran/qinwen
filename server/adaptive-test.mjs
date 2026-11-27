@@ -33,6 +33,7 @@ async function run() {
       if (prompt.includes('知识体系拆解教练')) {
         return reply({ facets: [{ name: '基础概念', points: [
           { name: '概念甲', cognitive_level: 1 }, { name: '概念乙', cognitive_level: 2 },
+          { name: '概念丙', cognitive_level: 3 },
         ] }] });
       }
       if (prompt.includes('出题老师')) {
@@ -124,7 +125,39 @@ async function run() {
     assert(review.due[0].weakness > review.due[1].weakness, '复习队列带薄弱度且排序正确');
     assert(review.due[0].recent_rate === 0 && review.due[0].recent_n === 3, '复习队列带近 7 天作答数据');
 
-    console.log('ADAPTIVE OK: 难度建议、薄弱排行与复习优先级均生效');
+    // --- 5. 跨知识点累计：主流程「出下一题」会切知识点，不能每个点都从定档重来 ---
+    const domain2 = await post('/api/domains', { name: '跨知识点定档领域', level: '零基础' });
+    await post(`/api/domains/${domain2.id}/build`, {});
+    const detail2 = await call(`/api/domains/${domain2.id}`);
+    const pts = detail2.nodes.filter(n => n.parent_id);
+    assert(pts.length >= 3, '至少三个知识点用于跨知识点定档');
+    const seq = [];
+    for (let i = 0; i < 3; i++) {
+      const p = pts[i];
+      const q = await post('/api/questions', { node_id: p.id, difficulty: 2 });
+      await post('/api/attempts', { question_id: q.question.id, answer: '正确项', duration_ms: 5000 });
+      // 模拟「出下一题」：问的是下一个知识点，它自己还没有任何作答
+      const next = pts[(i + 1) % 3];
+      seq.push(await call(`/api/difficulty/advice?node_id=${next.id}&domain_id=${domain2.id}`));
+    }
+    assert(seq[0].samples === 1 && seq[0].scope === 'domain', '第 1 题后领域累计 1 题，不归零');
+    assert(seq[1].samples === 2 && seq[1].scope === 'domain', '第 2 题后领域累计 2 题，不归零');
+    const cross = seq[2];
+    assert(cross.phase === 'adaptive' && cross.recommended === 3 && cross.scope === 'domain', '跨知识点累计 3 题后升到 3 档');
+    assert(cross.node_samples === 1 && cross.samples === 3, '样本不足时统计口径回退到同领域');
+    assert(cross.reason.includes('领域累计定档') && cross.reason.includes('升到 3 档'), '回退定档给出可解释原因');
+
+    // --- 6. 升档后要先在新档位答对 2 题，不能一题就继续跳档 ---
+    const one = await post('/api/questions', { node_id: pts[1].id, difficulty: 3 });
+    await post('/api/attempts', { question_id: one.question.id, answer: '正确项', duration_ms: 5000 });
+    const afterOne = await call(`/api/difficulty/advice?node_id=${pts[2].id}&domain_id=${domain2.id}`);
+    assert(afterOne.recommended === 3, '新档只答对 1 题时保持 3 档');
+    const two = await post('/api/questions', { node_id: pts[2].id, difficulty: 3 });
+    await post('/api/attempts', { question_id: two.question.id, answer: '正确项', duration_ms: 5000 });
+    const afterTwo = await call(`/api/difficulty/advice?node_id=${pts[0].id}&domain_id=${domain2.id}`);
+    assert(afterTwo.recommended === 4, '同档连对 2 题后才升到 4 档');
+
+    console.log('ADAPTIVE OK: 难度建议、薄弱排行、复习优先级、跨知识点累计与升档节奏均生效');
   } finally {
     child.kill('SIGTERM');
     mock.close();
